@@ -1,0 +1,251 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@media print {
+  @page {
+    size: A4 portrait;
+    margin: 11mm;
+  }
+
+  html,
+  body,
+  #root {
+    width: auto !important;
+    height: auto !important;
+    min-width: 0 !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    overflow: visible !important;
+    background: #fff !important;
+    font-size: 10pt !important;
+  }
+
+  #root:has(.report-page),
+  .app-shell:has(.report-page),
+  .app-shell:has(.report-page) > .recon-scope {
+    display: block !important;
+    width: auto !important;
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    overflow: visible !important;
+  }
+
+  .app-shell:has(.report-page) > div:first-child {
+    display: none !important;
+  }
+
+  .report-page {
+    display: block !important;
+    width: auto !important;
+    height: auto !important;
+    min-height: auto !important;
+    max-height: none !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    background: #fff !important;
+    color: #172033 !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  .report-page > div {
+    width: 100% !important;
+    max-width: 190mm !important;
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    overflow: visible !important;
+    margin: 0 auto !important;
+  }
+
+  .report-page .report-actions,
+  .report-page button,
+  .report-page .report-match-controls {
+    display: none !important;
+  }
+
+  .report-page > div > header {
+    break-after: avoid;
+    page-break-after: avoid;
+  }
+
+  .report-page > div {
+    display: block !important;
+  }
+
+  .report-page .report-page-break-after {
+    display: block !important;
+    break-after: page !important;
+    page-break-after: always !important;
+  }
+
+  .report-page .report-print-break {
+    display: block !important;
+    break-before: page !important;
+    page-break-before: always !important;
+    break-inside: auto !important;
+    page-break-inside: auto !important;
+  }
+
+  .report-page .report-page-three {
+    display: block !important;
+    break-before: page !important;
+    page-break-before: always !important;
+    break-after: auto !important;
+    page-break-after: auto !important;
+    break-inside: auto !important;
+    page-break-inside: auto !important;
+  }
+
+  .report-page .report-channel-section {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .report-page .overflow-x-auto,
+  .report-page .overflow-hidden,
+  .report-page .overflow-auto {
+    overflow: visible !important;
+  }
+
+  .report-page table {
+    width: 100% !important;
+    min-width: 0 !important;
+    table-layout: auto;
+    border-collapse: collapse;
+    font-size: 7pt;
+  }
+
+  .report-page th,
+  .report-page td {
+    padding: 4px 3px !important;
+    overflow-wrap: anywhere;
+    word-break: normal;
+  }
+
+  .report-page thead {
+    display: table-header-group;
+  }
+
+  .report-page tr {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .report-page .report-collapsed-row {
+    display: table-row !important;
+  }
+
+  .report-page h1,
+  .report-page h2,
+  .report-page p {
+    orphans: 3;
+    widows: 3;
+  }
+
+  .report-collapsed-row {
+    display: none;
+  }
+
+  .report-page section {
+    box-shadow: none !important;
+  }
+
+}
+
+@layer base {
+  :root {
+    --background: 210 33% 97%;
+    --foreground: 215 45% 16%;
+    --card: 0 0% 100%;
+    --card-foreground: 215 45% 16%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 215 45% 16%;
+    --primary: 217 91% 52%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 210 30% 94%;
+    --secondary-foreground: 215 45% 20%;
+    --muted: 210 25% 94%;
+    --muted-foreground: 215 20% 48%;
+    --accent: 43 96% 52%;
+    --accent-foreground: 215 45% 16%;
+    --destructive: 0 78% 54%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 214 32% 88%;
+    --input: 214 32% 88%;
+    --ring: 217 91% 52%;
+    --radius: 0.75rem;
+    --sidebar-background: 216 48% 15%;
+    --sidebar-foreground: 210 30% 94%;
+    --sidebar-primary: 43 96% 52%;
+    --sidebar-primary-foreground: 216 48% 15%;
+    --sidebar-accent: 215 35% 23%;
+    --sidebar-accent-foreground: 0 0% 100%;
+    --sidebar-border: 215 35% 25%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    font-family: "Noto Kufi Arabic", "DM Sans", system-ui, sans-serif;
+    background: hsl(var(--background));
+  }
+
+  body {
+    @apply min-h-screen bg-background text-foreground antialiased;
+    margin: 0;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+
+  .font-mono {
+    font-family: "DM Sans", system-ui, sans-serif;
+    font-variant-numeric: proportional-nums;
+  }
+}
+
+@layer components {
+  .recon-scope {
+    background:
+      radial-gradient(circle at 12% 0%, hsl(217 91% 52% / 0.06), transparent 30rem),
+      hsl(var(--background));
+  }
+
+  /* Keep report colors meaningful and consistent with the dashboard legend. */
+  .report-bar-gold {
+    background-color: hsl(43 96% 52%);
+  }
+
+  .report-bar-blue {
+    background-color: hsl(217 91% 52%);
+  }
+
+  .report-bar-red {
+    background-color: hsl(0 78% 54%);
+  }
+
+  .report-bar-violet {
+    background-color: hsl(270 55% 56%);
+  }
+
+  .report-bar-teal {
+    background-color: hsl(181 72% 42%);
+  }
+
+  .report-bar-amber {
+    background-color: hsl(30 92% 50%);
+  }
+
+  .report-bar-cyan {
+    background-color: hsl(190 70% 43%);
+  }
+}

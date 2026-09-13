@@ -1,0 +1,1 @@
+function readPackage(pkg) { if (pkg.dependencies && pkg.dependencies['lightningcss']) { pkg.dependencies['lightningcss'] = '1.33.0'; } if (pkg.devDependencies && pkg.devDependencies['lightningcss']) { pkg.devDependencies['lightningcss'] = '1.33.0'; } return pkg; } module.exports = { hooks: { readPackage } };
