@@ -1854,6 +1854,7 @@ export default function Reconciliation2({ onBack, onStageAToMain, onStageBToMain
   if (stagePage === "stageF") {
     return <div dir="rtl" className="min-h-screen bg-slate-50 p-6 text-slate-900"><div className="mx-auto max-w-4xl space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-3"><button onClick={() => setStagePage("hub")} className="flex items-center gap-1 text-sm text-slate-500 hover:text-slate-900"><ChevronLeft className="h-4 w-4" />العودة لمنصة الفيزا</button><h1 className="text-xl font-black">F — تحويل إيصال SoftPOS إلى Excel</h1></div>
+      {error && <div role="alert" className="rounded-lg bg-red-100 p-3 text-sm text-red-800">{error}</div>}
       <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm"><div className="mb-3 flex items-center gap-2"><FileSpreadsheet className="h-5 w-5 text-slate-700" /><div><h2 className="text-sm font-bold">لصق إيصال SoftPOS</h2><p className="text-xs text-slate-500">الصق نص الإيصال لتحويل كل حركة إلى صف مستقل في ملف سوني كاشير فيزا</p></div></div><textarea value={softposText} onChange={e => setSoftposText(e.target.value)} placeholder="الصق نص إيصال SoftPOS هنا..." className="h-72 w-full resize-y rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs font-mono outline-none focus:ring-2 focus:ring-slate-200" />
       <div className="mt-3 flex flex-wrap gap-2"><button onClick={handleParseSoftPOS} disabled={!softposText.trim()} className="flex items-center gap-2 rounded-lg bg-slate-700 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-40"><Download className="h-4 w-4" />إنشاء ملف Excel</button>{softposText.trim() && <button onClick={() => setSoftposText("")} className="flex items-center gap-1 rounded-lg bg-slate-100 px-3 py-2 text-xs text-slate-600 hover:bg-slate-200"><X className="h-3.5 w-3.5" />مسح النص</button>}</div></div>
       <div className="rounded-xl border border-blue-200 bg-blue-50 p-4 text-xs leading-6 text-blue-900">يتم استخراج رقم البطاقة، المبلغ، رقم التفويض، الوقت والتاريخ، نوع البطاقة، ورقم تعريف وتسلسل الحركة، مع إضافة بيانات المتجر والجهاز والمخرج إلى ملف Excel.</div>
@@ -1896,13 +1897,13 @@ export default function Reconciliation2({ onBack, onStageAToMain, onStageBToMain
         {/* Visa workflow hub */}
         <section className="grid grid-cols-1 gap-4 md:grid-cols-2">
           {[
-            { id: "stage-a", code: "A", title: "فرز الفواتير حسب قاعدة البيانات", description: "مطابقة اسم ومبلغ كل فاتورة مع قاعدة البيانات، ثم استخراج المطابقات ومشاكل أخرى.", color: "bg-blue-600", text: "text-blue-600", target: "stage-a" },
-            { id: "stage-b", code: "B", title: "المطابقة الذكية للفواتير والحوالات", description: "رفع أربعة ملفات عند العمل المستقل، أو ملفي الحوالات عند ترحيل الفواتير من قاعدة البيانات.", color: "bg-emerald-600", text: "text-emerald-600", target: "r2-bank" },
-            { id: "stage-c", code: "C", title: "مطابقة السوني كاشير (فيزا)", description: "مطابقة العمليات المعلقة واسترجاع أرقام التفويض مع بيانات الفيزا.", color: "bg-amber-600", text: "text-amber-600", target: "r2-sony" },
-            { id: "stage-d", code: "D", title: "مطابقة الفيزا — المرحلة الثانية", description: "مطابقة أرقام الفيزا المؤكدة مع الحوالات البنكية المعلقة.", color: "bg-indigo-600", text: "text-indigo-600", target: "r2-auth" },
-            { id: "stage-f", code: "F", title: "تحويل إيصال SoftPOS إلى Excel", description: "لصق نص الإيصال وتحويل الحركات وأرقام البطاقات والتفويض إلى ملف سوني جاهز.", color: "bg-slate-700", text: "text-slate-700", target: "r2-softpos" },
+            { id: "stage-a", code: "A", title: "فرز الفواتير حسب قاعدة البيانات", description: "مطابقة اسم ومبلغ كل فاتورة مع قاعدة البيانات، ثم استخراج المطابقات ومشاكل أخرى.", color: "bg-blue-600", text: "text-blue-600" },
+            { id: "stage-b", code: "B", title: "المطابقة الذكية للفواتير والحوالات", description: "فتح أداة مطابقة الفواتير والحوالات.", color: "bg-emerald-600", text: "text-emerald-600" },
+            { id: "stage-c", code: "C", title: "مطابقة السوني كاشير (فيزا)", description: "مطابقة العمليات المعلقة واسترجاع أرقام التفويض مع بيانات الفيزا.", color: "bg-amber-600", text: "text-amber-600" },
+            { id: "stage-d", code: "D", title: "مطابقة الفيزا — المرحلة الثانية", description: "مطابقة أرقام الفيزا المؤكدة مع الحوالات البنكية المعلقة.", color: "bg-indigo-600", text: "text-indigo-600" },
+            { id: "stage-f", code: "F", title: "تحويل إيصال SoftPOS إلى Excel", description: "لصق نص الإيصال وتحويل الحركات وأرقام البطاقات والتفويض إلى ملف سوني جاهز.", color: "bg-slate-700", text: "text-slate-700" },
           ].map(stage => (
-            <button key={stage.id} onClick={() => stage.id === "stage-a" ? setStagePage("stageA") : stage.id === "stage-b" ? (onStageBToMain ? onStageBToMain() : setStagePage("stageB")) : stage.id === "stage-c" ? setStagePage("stageC") : stage.id === "stage-d" ? setStagePage("stageD") : stage.id === "stage-f" ? setStagePage("stageF") : document.getElementById(stage.target)?.scrollIntoView({ behavior: "smooth", block: "start" })}
+            <button key={stage.id} onClick={() => stage.id === "stage-a" ? setStagePage("stageA") : stage.id === "stage-b" ? (onStageBToMain ? onStageBToMain() : setStagePage("stageB")) : stage.id === "stage-c" ? setStagePage("stageC") : stage.id === "stage-d" ? setStagePage("stageD") : setStagePage("stageF")}
               className="group flex min-h-36 items-center gap-5 rounded-2xl border border-slate-200 bg-white p-5 text-right shadow-sm transition-all hover:-translate-y-0.5 hover:border-slate-300 hover:shadow-md">
               <span className={`flex h-14 w-14 shrink-0 items-center justify-center rounded-xl ${stage.color} text-xl font-black text-white shadow-sm`}>{stage.code}</span>
               <span className="min-w-0 flex-1">
@@ -1913,208 +1914,6 @@ export default function Reconciliation2({ onBack, onStageAToMain, onStageBToMain
             </button>
           ))}
         </section>
-
-        <div className="rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-sm">
-          <div className="mb-3 flex items-center justify-between gap-3">
-            <h2 className="text-sm font-bold text-slate-800">تسلسل حركة البيانات الصحيح</h2>
-            <span className="rounded-full bg-slate-100 px-3 py-1 text-[11px] text-slate-500">النظام الحسابي</span>
-          </div>
-          <div className="flex flex-wrap items-center justify-center gap-2 text-xs font-medium">
-            {["A — الفرز والتأكيد", "B — تحويل الفواتير المؤكدة", "C — تصفية الفيزا", "D — قائمة الغد"].map((label, index) => (
-              <React.Fragment key={label}>
-                <span className="rounded-lg border border-blue-100 bg-blue-50 px-3 py-2 text-blue-700">{label}</span>
-                {index < 3 && <ChevronLeft className="h-4 w-4 text-slate-300" />}
-              </React.Fragment>
-            ))}
-          </div>
-        </div>
-
-        {error && <div className="p-3 bg-red-100 text-red-800 rounded-lg text-sm">{error}</div>}
-
-        {/* File uploads — 5 files */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          {/* 1. كشف البنك */}
-          <div id="r2-bank" className="bg-card border p-4 rounded-xl space-y-4 scroll-mt-5">
-            <h2 className="font-semibold text-sm flex items-center gap-2">
-              كشف البنك
-              {visaBankRows.length > 0 && (
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-teal-100 text-teal-700 border border-teal-300">
-                  {visaBankRows.length} فيزا بنك
-                </span>
-              )}
-            </h2>
-            {bankHeaders.length > 0 && (
-              <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-slate-600">
-                <input type="checkbox" checked={visaSwaps.bank} onChange={event => setVisaSwaps(prev => ({ ...prev, bank: event.target.checked }))} className="rounded" />
-                عكس المدين والدائن
-              </label>
-            )}
-            <DropZone file={bankFile} onFile={loadBank} onClear={() => { setBankFile(null); setBankHeaders([]); setBankRowsRaw([]); }} />
-            {bankHeaders.length > 0 && (
-              <div className="grid grid-cols-2 gap-2">
-                <Sel label="التاريخ" headers={bankHeaders} value={bankMap.date} onChange={v => setBankMap(m => ({ ...m, date: v }))} />
-                <Sel label="الإيضاحات / البيان" headers={bankHeaders} value={bankMap.desc} onChange={v => setBankMap(m => ({ ...m, desc: v }))} />
-                <Sel label="المبالغ المدفوعة (Debit)" headers={bankHeaders} value={bankMap.debit} onChange={v => setBankMap(m => ({ ...m, debit: v }))} />
-                <Sel label="المبالغ المستلمة (Credit)" headers={bankHeaders} value={bankMap.credit} onChange={v => setBankMap(m => ({ ...m, credit: v }))} />
-                <Sel label="نوع الحساب" headers={bankHeaders} value={bankMap.accountType} onChange={v => setBankMap(m => ({ ...m, accountType: v }))} />
-                <Sel label="المرجع / رقم الحوالة" headers={bankHeaders} value={bankMap.reference} onChange={v => setBankMap(m => ({ ...m, reference: v }))} />
-              </div>
-            )}
-            {visaBankRows.length > 0 && (
-              <div className="flex items-center gap-2 text-xs">
-                <span className="text-teal-700 font-medium">تم فرز {visaBankRows.length} حوالة "مشتريات عمولة تجار"</span>
-                <button onClick={handleMoveVisaBankToPending}
-                  className="flex items-center gap-1 px-3 py-1.5 bg-teal-600 text-white rounded-lg text-xs font-medium hover:bg-teal-700 transition-colors">
-                  <Clock className="w-3.5 h-3.5"/>نقل للمعلقة (لثاني يوم)
-                </button>
-              </div>
-            )}
-          </div>
-
-          {/* 2. كشف الأستاذ */}
-          <div id="r2-aza" className="bg-card border p-4 rounded-xl space-y-4 scroll-mt-5">
-            <h2 className="font-semibold text-sm flex items-center gap-2">
-              كشف الأستاذ
-              {azaVisaRows.length > 0 && (
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-teal-100 text-teal-700 border border-teal-300">
-                  {azaVisaRows.length} فيزا
-                </span>
-              )}
-            </h2>
-            {azaHeaders.length > 0 && (
-              <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-slate-600">
-                <input type="checkbox" checked={visaSwaps.aza} onChange={event => setVisaSwaps(prev => ({ ...prev, aza: event.target.checked }))} className="rounded" />
-                عكس المدين والدائن
-              </label>
-            )}
-            <DropZone file={azaFile} onFile={loadAza} onClear={() => { setAzaFile(null); setAzaHeaders([]); setAzaRowsRaw([]); }} />
-            {azaHeaders.length > 0 && (
-              <div className="grid grid-cols-2 gap-2">
-                <Sel label="التاريخ" headers={azaHeaders} value={azaMap.date} onChange={v => setAzaMap(m => ({ ...m, date: v }))} />
-                <Sel label="البيان" headers={azaHeaders} value={azaMap.name} onChange={v => setAzaMap(m => ({ ...m, name: v }))} />
-                <Sel label="المبالغ المدفوعة (Debit)" headers={azaHeaders} value={azaMap.debit} onChange={v => setAzaMap(m => ({ ...m, debit: v }))} />
-                <Sel label="المبالغ المستلمة (Credit)" headers={azaHeaders} value={azaMap.credit} onChange={v => setAzaMap(m => ({ ...m, credit: v }))} />
-                <Sel label="نوع الحساب" headers={azaHeaders} value={azaMap.accountType} onChange={v => setAzaMap(m => ({ ...m, accountType: v }))} />
-                <Sel label="المرجع / رقم الحوالة" headers={azaHeaders} value={azaMap.reference} onChange={v => setAzaMap(m => ({ ...m, reference: v }))} />
-              </div>
-            )}
-          </div>
-
-          {/* 3. كشف اليومي كاشير */}
-          <div id="r2-daily" className="bg-card border p-4 rounded-xl space-y-4 scroll-mt-5">
-            <h2 className="font-semibold text-sm flex items-center gap-2">
-              📅 كشف اليومي كاشير
-              {parsedDaily.length > 0 && azaOnlyRows.length > 0 && (
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 border border-amber-300">
-                  {azaOnlyRows.length} زيادة بالأستاذ
-                </span>
-              )}
-            </h2>
-            {dailyHeaders.length > 0 && (
-              <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-slate-600">
-                <input type="checkbox" checked={visaSwaps.daily} onChange={event => setVisaSwaps(prev => ({ ...prev, daily: event.target.checked }))} className="rounded" />
-                عكس المدين والدائن
-              </label>
-            )}
-            <DropZone file={dailyFile} onFile={loadDaily} onClear={() => { setDailyFile(null); setDailyHeaders([]); setDailyRowsRaw([]); }} />
-            {dailyHeaders.length > 0 && (
-              <div className="grid grid-cols-2 gap-2">
-                <Sel label="التاريخ" headers={dailyHeaders} value={dailyMap.date} onChange={v => setDailyMap(m => ({ ...m, date: v }))} />
-                <Sel label="البيان" headers={dailyHeaders} value={dailyMap.name} onChange={v => setDailyMap(m => ({ ...m, name: v }))} />
-                <Sel label="المبالغ المدفوعة (Debit)" headers={dailyHeaders} value={dailyMap.debit} onChange={v => setDailyMap(m => ({ ...m, debit: v }))} />
-                <Sel label="المبالغ المستلمة (Credit)" headers={dailyHeaders} value={dailyMap.credit} onChange={v => setDailyMap(m => ({ ...m, credit: v }))} />
-                <Sel label="نوع الحساب" headers={dailyHeaders} value={dailyMap.accountType} onChange={v => setDailyMap(m => ({ ...m, accountType: v }))} />
-                <Sel label="المرجع / رقم الحوالة" headers={dailyHeaders} value={dailyMap.reference} onChange={v => setDailyMap(m => ({ ...m, reference: v }))} />
-              </div>
-            )}
-          </div>
-
-          {/* 4. سوني كاشير فيزا */}
-          <div id="r2-sony" className="bg-card border p-4 rounded-xl space-y-4 scroll-mt-5">
-            <h2 className="font-semibold text-sm flex items-center gap-2">
-              🏪 سوني كاشير فيزا
-              {parsedSony.length > 0 && (
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 border border-indigo-300">
-                  {parsedSony.length} فاتورة
-                </span>
-              )}
-            </h2>
-            {sonyHeaders.length > 0 && (
-              <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-slate-600">
-                <input type="checkbox" checked={visaSwaps.sony} onChange={event => setVisaSwaps(prev => ({ ...prev, sony: event.target.checked }))} className="rounded" />
-                عكس المدين والدائن
-              </label>
-            )}
-            <DropZone file={sonyFile} onFile={loadSony} onClear={() => { setSonyFile(null); setSonyHeaders([]); setSonyRowsRaw([]); }} />
-            {sonyHeaders.length > 0 && (
-              <div className="grid grid-cols-2 gap-2">
-                <Sel label="التاريخ" headers={sonyHeaders} value={sonyMap.date} onChange={v => setSonyMap(m => ({ ...m, date: v }))} />
-                <Sel label="البيان (اسم الزبون)" headers={sonyHeaders} value={sonyMap.name} onChange={v => setSonyMap(m => ({ ...m, name: v }))} />
-                <Sel label="المبالغ المدفوعة (Debit)" headers={sonyHeaders} value={sonyMap.debit} onChange={v => setSonyMap(m => ({ ...m, debit: v }))} />
-                <Sel label="المبالغ المستلمة (Credit)" headers={sonyHeaders} value={sonyMap.credit} onChange={v => setSonyMap(m => ({ ...m, credit: v }))} />
-                <Sel label="نوع الحساب" headers={sonyHeaders} value={sonyMap.accountType} onChange={v => setSonyMap(m => ({ ...m, accountType: v }))} />
-                <Sel label="رقم التفويض" headers={sonyHeaders} value={sonyMap.authNum} onChange={v => setSonyMap(m => ({ ...m, authNum: v }))} />
-              </div>
-            )}
-          </div>
-
-          {/* 5. رقم التفويض فيزا */}
-          <div id="r2-auth" className="bg-card border p-4 rounded-xl space-y-4 lg:col-span-2 scroll-mt-5">
-            <h2 className="font-semibold text-sm flex items-center gap-2">
-              🔢 رقم التفويض فيزا
-              {parsedAuth.length > 0 && (
-                <span className="text-[10px] px-2 py-0.5 rounded-full bg-purple-100 text-purple-700 border border-purple-300">
-                  {parsedAuth.length} سجل
-                </span>
-              )}
-            </h2>
-            {authHeaders.length > 0 && (
-              <label className="flex w-fit cursor-pointer items-center gap-2 text-xs text-slate-600">
-                <input type="checkbox" checked={visaSwaps.auth} onChange={event => setVisaSwaps(prev => ({ ...prev, auth: event.target.checked }))} className="rounded" />
-                عكس المدين والدائن
-              </label>
-            )}
-            <DropZone file={authFile} onFile={loadAuth} onClear={() => { setAuthFile(null); setAuthHeaders([]); setAuthRowsRaw([]); }} />
-            {authHeaders.length > 0 && (
-              <div className="grid grid-cols-2 gap-2">
-                <Sel label="الاسم" headers={authHeaders} value={authMap.name} onChange={v => setAuthMap(m => ({ ...m, name: v }))} />
-                <Sel label="رقم التفويض" headers={authHeaders} value={authMap.authNum} onChange={v => setAuthMap(m => ({ ...m, authNum: v }))} />
-                <Sel label="المبلغ" headers={authHeaders} value={authMap.amount} onChange={v => setAuthMap(m => ({ ...m, amount: v }))} />
-                <Sel label="التاريخ" headers={authHeaders} value={authMap.date} onChange={v => setAuthMap(m => ({ ...m, date: v }))} />
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* SoftPOS is available on the dedicated F page. */}
-        {false && <div id="r2-softpos" className="bg-card border p-4 rounded-xl space-y-3 scroll-mt-5">
-          <div className="flex items-center gap-2 flex-wrap">
-            <h2 className="font-semibold text-sm flex items-center gap-2">
-              F — لصق إيصال SoftPOS وتحويله إلى Excel
-            </h2>
-            <span className="text-[10px] text-muted-foreground">الصق نص الإيصال وهنطلعلك ملف سوني كاشير فيزا جاهز</span>
-          </div>
-          <textarea
-            value={softposText}
-            onChange={e => setSoftposText(e.target.value)}
-            placeholder="الصق هون نص إيصال SoftPOS كامل (اسم المتجر، الحركات، أرقام البطاقات، أرقام التفويض، المباليع...)"
-            dir="rtl"
-            className="w-full h-48 p-3 text-xs font-mono border border-border rounded-lg bg-input-background focus:outline-none focus:ring-1 focus:ring-ring resize-y"
-          />
-          <div className="flex items-center gap-2 flex-wrap">
-            <button onClick={handleParseSoftPOS}
-              disabled={!softposText.trim()}
-              className="flex items-center gap-2 px-4 py-2 bg-teal-600 text-white rounded-lg text-sm font-medium hover:bg-teal-700 disabled:opacity-40 transition-colors">
-              <Download className="w-4 h-4"/>إنشاء ملف سوني كاشير فيزا
-            </button>
-            {softposText.trim() && (
-              <button onClick={() => setSoftposText("")}
-                className="flex items-center gap-1 px-3 py-2 bg-muted text-muted-foreground rounded-lg text-xs hover:bg-muted/80 transition-colors">
-                <X className="w-3.5 h-3.5"/>مسح النص
-              </button>
-            )}
-          </div>
-        </div>}
 
         {/* Results */}
         {(parsedBank.length > 0 || parsedAza.length > 0 || parsedSony.length > 0) && (

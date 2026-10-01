@@ -74,7 +74,7 @@ export function parseTabularRows(rows: StatementCell[][]): { headers: string[]; 
     headers.push(count > 1 ? `${column.header} (${count})` : column.header)
   }
   const normalizedHeaders = columns.map((column) => normalizeHeader(column.header))
-  const data = rows.slice(headerIndex + 1).filter((row) => row.some(hasValue)).flatMap((row) => {
+  const data = rows.slice(headerIndex + 1).filter((row) => row.some(hasValue) && !isMetadataRow(row)).flatMap((row) => {
     const normalizedRow = columns.map((column) => normalizeHeader(row[column.index]))
     if (normalizedRow.length === normalizedHeaders.length && normalizedRow.every((cell, index) => cell === normalizedHeaders[index])) return []
     if (!columns.some((column) => hasValue(row[column.index]))) return []
@@ -131,6 +131,32 @@ function hasValue(value: StatementCell): boolean {
   return value !== null && value !== undefined && String(value).trim() !== ""
 }
 
+function isMetadataRow(row: StatementCell[]): boolean {
+  return row.some((cell) => /issued\s+(?:on|by)|أصدرها|أصدرت\s+بتاريخ|نسخة\s+مرخصة|رقم\s+الصفحة/i.test(String(cell ?? "")))
+}
+
+function isDateValue(value: StatementCell): boolean {
+  if (value instanceof Date) return !Number.isNaN(value.getTime())
+  const text = String(value ?? "").trim()
+  if (/^\d{4,5}$/.test(text)) {
+    const serial = Number(text)
+    return serial >= 20000 && serial <= 80000
+  }
+  const match = text.match(/^(\d{1,4})[/-](\d{1,2})[/-](\d{1,4})$/)
+  if (!match) return false
+  const [, first, second, third] = match
+  const [year, month, day] = first.length === 4
+    ? [Number(first), Number(second), Number(third)]
+    : [Number(third), Number(second), Number(first)]
+  return year >= 1900 && year <= 2200 && month >= 1 && month <= 12 && day >= 1 && day <= 31
+}
+
+function isNumericAmount(value: StatementCell): boolean {
+  if (typeof value === "number") return Number.isFinite(value)
+  const text = String(value ?? "").trim().replace(/[,\s٬]/g, "").replace(/[^\d.+()-]/g, "")
+  return /^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(text) || /^\((?:\d+\.?\d*|\.\d+)\)$/.test(text)
+}
+
 export function extractStatementRows(sheets: StatementSheet[]): ExtractedStatement | null {
   const special = extractRecognizedStatementRows(sheets)
   if (special) return special
@@ -182,10 +208,11 @@ function extractRecognizedStatementRows(sheets: StatementSheet[]): ExtractedStat
       if (!active || !readingTransactions || active.format !== format) continue
       if (active.format === "bank") {
         const transaction = active.transactionIndexes.map((index) => sourceRow[index] ?? "")
-        if (!hasValue(transaction[0]) || !hasValue(transaction[1])) continue
-        if (!transaction.slice(2, 6).some(hasValue)) continue
+        if (!isDateValue(transaction[0]) && !isDateValue(transaction[1])) continue
+        if (!isNumericAmount(transaction[4]) && !isNumericAmount(transaction[5])) continue
         rows.push(transaction)
       } else {
+        if (isMetadataRow(sourceRow)) continue
         const transaction = active.indexes.map((index) => index < 0 ? "" : sourceRow[index] ?? "")
         if (!hasValue(transaction[0])) continue
         if (!transaction.some(hasValue)) continue

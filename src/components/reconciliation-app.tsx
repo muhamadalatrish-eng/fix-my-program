@@ -5,7 +5,7 @@ import * as XLSX from "xlsx";
 import Reconciliation2, { type StageAResult } from "./Reconciliation2";
 import { BatchCutoffTool, ClearingTool, SplitTool, syntheticTransactionId, transactionKey, type BankSplit, type ClearingGroup, type CutoffBatch, type CutoffRowRef, type SplitAllocation, type ToolBankRow, type ToolCashierRow } from "./reconciliation-tools";
 import { Upload, FileSpreadsheet, Download, ChevronDown, X, Trash2, TriangleAlert as AlertTriangle, Check, Search, Link2, Link2Off, ChevronLeft, ChevronRight, CreditCard, Sparkles, Info, Save, Shield, FolderOpen, FolderPlus, RotateCcw, FolderMinus, GripVertical, Landmark, Users, BarChart3, ArrowUpRight, Plus } from "lucide-react";
-import { parseTabularRows, type StatementCell } from "../lib/account-statement-processor";
+import { extractStatementRows, parseTabularRows, type StatementCell } from "../lib/account-statement-processor";
 
 // ─── Excel helpers ────────────────────────────────────────────────────────────
 function readFileBuf(f: File): Promise<ArrayBuffer> {
@@ -26,6 +26,41 @@ function parseSheet(buf: ArrayBuffer) {
     return { headers: parsed.headers, rows };
   }
   throw new Error("لم أتمكن من العثور على صف عناوين وبيانات في الملف.");
+}
+function parseJawwalPaySheet(buf: ArrayBuffer) {
+  const workbook = XLSX.read(buf, { type: "array", cellDates: true });
+  const statement = extractStatementRows(workbook.SheetNames.map(name => ({
+    rows: XLSX.utils.sheet_to_json<StatementCell[]>(workbook.Sheets[name], { header: 1, defval: "", raw: false }),
+  })));
+  if (statement?.format !== "ledger") return parseSheet(buf);
+  return cleanJawwalPayLedger(statement.headers, statement.rows.map(values =>
+    Object.fromEntries(statement.headers.map((header, index) => [header, values[index] ?? ""]))
+  ));
+}
+function cleanJawwalPayLedger(headers: string[], rows: Record<string, unknown>[]) {
+  const entryHeader = headers.find(header => /رقم\s*القيد/.test(normalizeColumnName(header)));
+  const debitHeader = headers.find(header => /^(?:ال)?مدين$|^debit$/.test(normalizeColumnName(header)));
+  const creditHeader = headers.find(header => /^(?:ال)?دائن$|^credit$/.test(normalizeColumnName(header)));
+  const isLedger = !!entryHeader && !!debitHeader && !!creditHeader &&
+    headers.some(header => /رصيد|balance/i.test(header));
+  const outputHeaders = isLedger ? headers.filter(header => !/رصيد|balance/i.test(header)) : headers;
+  if (!isLedger) return { headers: outputHeaders, rows };
+  const outputRows = rows.filter(row => {
+    return isJawwalPayLedgerMovement(headers, row);
+  }).map(row => Object.fromEntries(outputHeaders.map(header => [header, row[header] ?? ""])));
+  return { headers: outputHeaders, rows: outputRows };
+}
+function isJawwalPayLedgerMovement(headers: string[], row: Record<string, unknown>) {
+  const entryHeader = headers.find(header => /رقم\s*القيد/.test(normalizeColumnName(header)));
+  const debitHeader = headers.find(header => /^(?:ال)?مدين$|^debit$/.test(normalizeColumnName(header)));
+  const creditHeader = headers.find(header => /^(?:ال)?دائن$|^credit$/.test(normalizeColumnName(header)));
+  const isLedger = !!entryHeader && !!debitHeader && !!creditHeader &&
+    headers.some(header => /رصيد|balance/i.test(header));
+  if (!isLedger) return true;
+  const entryNumber = String(row[entryHeader] ?? "").trim().replace(/[٠-٩]/g, digit => String("٠١٢٣٤٥٦٧٨٩".indexOf(digit)));
+  const debit = Math.abs(toNum(row[debitHeader]));
+  const credit = Math.abs(toNum(row[creditHeader]));
+  return /^\d+$/.test(entryNumber) && (debit > 0 || credit > 0);
 }
 function downloadCleanedSheet(fileName: string, headers: string[], rows: Record<string, unknown>[]) {
   if (!headers.length || !rows.length) return;
@@ -255,6 +290,7 @@ interface FileSnapshot {
   headers: string[];
   rows: Record<string, unknown>[];
   savedAt: string;
+  fileCount?: number;
 }
 interface ManualMatchGroup {
   id: string;
@@ -486,6 +522,17 @@ function smartNameKey(value: string): string {
   return tokens.length >= 2 ? `${tokens[0]} ${tokens[tokens.length - 1]}` : tokens.join(" ");
 }
 
+function extractMobileNumber(value: string): string | null {
+  const digits = value.replace(/\D/g, "");
+  const matches = digits.match(/(?:00970|970|0)?5\d{8}/g) ?? [];
+  const normalized = [...new Set(matches.map(number =>
+    number.startsWith("00970") ? `0${number.slice(5)}` :
+    number.startsWith("970") ? `0${number.slice(3)}` :
+    number.startsWith("5") ? `0${number}` : number
+  ))];
+  return normalized.length === 1 ? normalized[0] : null;
+}
+
 function smartAliasTarget(cashierName: string, bankDescription: string): string {
   return bankDescription.split("/")
     .map(segment => segment.trim())
@@ -505,16 +552,32 @@ function reconcile(
   mahmoudWalletCashierIds: Set<number>,
   amountTolerancePercent: number = 0.5,
   aliases: Record<string, string> = {},
+  jawwalAccountType = "جوال بي",
 ): MatchResult[] {
   const results: MatchResult[] = [];
   const usedBank = new Set<number>();
   const usedCashier = new Set<number>();
 
-  const savedKeys = new Set(savedMatches.map(s => `${s.cashierId}-${s.bankId}`));
-  const savedCashierIds = new Set(savedMatches.map(s => s.cashierId));
-  const savedBankIds = new Set(savedMatches.map(s => s.bankId));
+  const jawwalAccountKey = jawwalAccountType.trim().toLocaleLowerCase();
+  const isJawwalRow = (row: BankRow | CashierRow) =>
+    row.accountType.trim().toLocaleLowerCase() === jawwalAccountKey;
+  const eligibleSavedMatches = savedMatches.filter(match => {
+    const bankRow = bank.find(row => row.id === match.bankId);
+    const cashierRow = cashier.find(row => row.id === match.cashierId);
+    if (!bankRow || !cashierRow) return true;
+    const jawwalMatch = isJawwalRow(bankRow) || isJawwalRow(cashierRow);
+    if (!jawwalMatch) return true;
+    const bankPhone = extractMobileNumber(bankRow.description);
+    const cashierPhone = extractMobileNumber(`${cashierRow.rawName} ${cashierRow.name}`);
+    return isJawwalRow(bankRow) && isJawwalRow(cashierRow)
+      && Boolean(bankPhone) && bankPhone === cashierPhone
+      && Math.abs(bankRow.rawAmount - cashierRow.matchAmount) <= 0.01;
+  });
+  const savedKeys = new Set(eligibleSavedMatches.map(s => `${s.cashierId}-${s.bankId}`));
+  const savedCashierIds = new Set(eligibleSavedMatches.map(s => s.cashierId));
+  const savedBankIds = new Set(eligibleSavedMatches.map(s => s.bankId));
 
-  savedMatches.forEach(sm => {
+  eligibleSavedMatches.forEach(sm => {
     const bankRow = bank.find(b => b.id === sm.bankId);
     const cashierRow = cashier.find(c => c.id === sm.cashierId);
     if (bankRow && cashierRow) {
@@ -523,6 +586,47 @@ function reconcile(
       usedCashier.add(cashierRow.id);
     }
   });
+
+  const jawwalBanksByPhone = new Map<string, BankRow[]>();
+  bank.forEach(row => {
+    if (usedBank.has(row.id) || savedBankIds.has(row.id) || !isJawwalRow(row)) return;
+    const phone = extractMobileNumber(row.description);
+    if (!phone) return;
+    jawwalBanksByPhone.set(phone, [...(jawwalBanksByPhone.get(phone) ?? []), row]);
+  });
+  const jawwalCashiersByPhone = new Map<string, CashierRow[]>();
+  cashier.forEach(row => {
+    if (usedCashier.has(row.id) || savedCashierIds.has(row.id) || !isJawwalRow(row)) return;
+    const phone = extractMobileNumber(`${row.rawName} ${row.name}`);
+    if (!phone) return;
+    jawwalCashiersByPhone.set(phone, [...(jawwalCashiersByPhone.get(phone) ?? []), row]);
+  });
+  jawwalCashiersByPhone.forEach((cashiers, phone) => {
+    const banks = jawwalBanksByPhone.get(phone);
+    if (!banks?.length) return;
+    const possiblePairs = cashiers.flatMap(cashier => banks
+      .filter(bankRow => !usedBank.has(bankRow.id) && !rejectedPairs.has(`${cashier.id}-${bankRow.id}`))
+      .map(bankRow => ({ cashier, bank: bankRow, amountDiff: Math.abs(bankRow.rawAmount - cashier.matchAmount) }))
+      .filter(pair => pair.amountDiff <= 0.01))
+      .sort((a, b) => a.amountDiff - b.amountDiff);
+    possiblePairs.forEach(({ cashier: cashierRow, bank: bankRow, amountDiff }) => {
+      if (usedCashier.has(cashierRow.id) || usedBank.has(bankRow.id)) return;
+      results.push({
+        type: "pending",
+        bank: bankRow,
+        cashier: cashierRow,
+        isApprox: false,
+        isExactAmount: true,
+        matchType: "phone",
+        amountDiff: 0,
+        matchScore: 100,
+        accountTypeDiff: false,
+      });
+      usedCashier.add(cashierRow.id);
+      usedBank.add(bankRow.id);
+    });
+  });
+
   cashier.forEach(c => {
     if (usedCashier.has(c.id) || savedCashierIds.has(c.id)) return;
     if (jawwalPayCashierIds.has(c.id)) {
@@ -546,6 +650,7 @@ function reconcile(
     if (usedCashier.has(c.id) || savedCashierIds.has(c.id) || visaCashierIds.has(c.id) || jawwalPayCashierIds.has(c.id) || mahmoudWalletCashierIds.has(c.id)) return;
     bank.forEach(b => {
       if (usedBank.has(b.id) || savedBankIds.has(b.id) || c.type !== b.type) return;
+      if (isJawwalRow(c) || isJawwalRow(b)) return;
       const pairKey = `${c.id}-${b.id}`;
       if (rejectedPairs.has(pairKey) || savedKeys.has(pairKey)) return;
       const amountTolerance = Math.max(0.01, c.matchAmount * amountTolerancePercent / 100);
@@ -576,8 +681,8 @@ function reconcile(
     usedCashier.add(candidate.cashier.id);
   });
 
-  const remC = cashier.filter(c => !usedCashier.has(c.id) && !savedCashierIds.has(c.id) && !visaCashierIds.has(c.id) && !jawwalPayCashierIds.has(c.id) && !mahmoudWalletCashierIds.has(c.id));
-  const remB = bank.filter(b => !usedBank.has(b.id) && !savedBankIds.has(b.id));
+  const remC = cashier.filter(c => !isJawwalRow(c) && !usedCashier.has(c.id) && !savedCashierIds.has(c.id) && !visaCashierIds.has(c.id) && !jawwalPayCashierIds.has(c.id) && !mahmoudWalletCashierIds.has(c.id));
+  const remB = bank.filter(b => !isJawwalRow(b) && !usedBank.has(b.id) && !savedBankIds.has(b.id));
 
   const getBase = (name:string) => normName(name).split(" ").filter(t=>t.length>2&&t!=="al").slice(0,2).join(" ");
   const groups: Record<string,{cashiers:CashierRow[];banks:BankRow[]}> = {};
@@ -631,7 +736,7 @@ function reconcile(
 
   cashier.forEach(c => {
     if (usedCashier.has(c.id) || savedCashierIds.has(c.id) || visaCashierIds.has(c.id) || jawwalPayCashierIds.has(c.id) || mahmoudWalletCashierIds.has(c.id)) return;
-    const hasAmt = bank.some(b => !usedBank.has(b.id) && !savedBankIds.has(b.id) &&
+    const hasAmt = bank.some(b => !isJawwalRow(b) && !usedBank.has(b.id) && !savedBankIds.has(b.id) &&
       b.type === c.type && Math.abs(b.rawAmount - c.matchAmount) <= 0.01);
     results.push({
       type:"unmatchedCashier",
@@ -642,7 +747,7 @@ function reconcile(
 
   bank.forEach(b => {
     if (usedBank.has(b.id) || savedBankIds.has(b.id)) return;
-    const hasAmt = cashier.some(c => !usedCashier.has(c.id) && !savedCashierIds.has(c.id) && !visaCashierIds.has(c.id) && !jawwalPayCashierIds.has(c.id) && !mahmoudWalletCashierIds.has(c.id) &&
+    const hasAmt = cashier.some(c => !isJawwalRow(c) && !usedCashier.has(c.id) && !savedCashierIds.has(c.id) && !visaCashierIds.has(c.id) && !jawwalPayCashierIds.has(c.id) && !mahmoudWalletCashierIds.has(c.id) &&
       c.type === b.type && Math.abs(c.matchAmount - b.rawAmount) <= 0.01);
     results.push({
       type:"unmatchedBank",
@@ -1119,26 +1224,103 @@ const HINTS={
   direction: ["مدين/دائن","مدين دائن","debit credit","transaction side","نوع القيد"],
 };
 
+type MergeRole = "bank" | "cash" | "jawwalBank";
+type ColumnRole = "date" | "description" | "debit" | "credit" | "accountType" | "ref" | "totalAmount" | "movementAmount" | "direction";
+
+function normalizeColumnName(value: string): string {
+  return value.toLowerCase().normalize("NFKC").replace(/[\u064b-\u065f\u0670]/g, "").replace(/[_-]+/g, " ").replace(/[^\p{L}\p{N}]+/gu, " ").replace(/\s+/g, " ").trim();
+}
+
+function columnRole(header: string, role: MergeRole): ColumnRole | null {
+  const roles: Array<[ColumnRole, string[]]> = [
+    ["date", HINTS.date],
+    [role === "cash" ? "description" : "description", role === "cash" ? HINTS.name : HINTS.desc],
+    ["debit", HINTS.debit],
+    ["credit", HINTS.credit],
+    ["accountType", HINTS.accountType],
+    ["ref", HINTS.ref],
+  ];
+  if (role === "jawwalBank") roles.push(["totalAmount", HINTS.totalAmount], ["movementAmount", HINTS.movementAmount], ["direction", HINTS.direction]);
+  const normalized = normalizeColumnName(header);
+  let best: { role: ColumnRole; score: number } | null = null;
+  for (const [candidateRole, hints] of roles) {
+    for (const hint of hints) {
+      const candidate = normalizeColumnName(hint);
+      const score = normalized === candidate ? 4 : candidate.length > 2 && normalized.includes(candidate) ? 1 : 0;
+      if (score > (best?.score ?? 0)) best = { role: candidateRole, score };
+    }
+  }
+  return best?.role ?? null;
+}
+
+async function parseAndMergeFiles(files: File[], role: MergeRole, previous?: { fileName: string; headers: string[]; rows: Record<string, unknown>[] }) {
+  if (!files.length) throw new Error("اختر ملفاً واحداً على الأقل.");
+  const parsedFiles = [
+    ...(previous ? [previous] : []),
+    ...await Promise.all(files.map(async file => ({
+    fileName: file.name,
+    ...(role === "jawwalBank" ? parseJawwalPaySheet(await readFileBuf(file)) : parseSheet(await readFileBuf(file))),
+    }))),
+  ];
+  const headers = [...parsedFiles[0].headers];
+  const headerByRole = new Map<ColumnRole, string>();
+  headers.forEach(header => {
+    const detectedRole = columnRole(header, role);
+    if (detectedRole && !headerByRole.has(detectedRole)) headerByRole.set(detectedRole, header);
+  });
+  for (const parsed of parsedFiles.slice(1)) {
+    for (const header of parsed.headers) {
+      const detectedRole = columnRole(header, role);
+      const canonicalHeader = detectedRole ? headerByRole.get(detectedRole) : undefined;
+      if (!canonicalHeader && !headers.some(existing => normalizeColumnName(existing) === normalizeColumnName(header))) {
+        headers.push(header);
+        if (detectedRole) headerByRole.set(detectedRole, header);
+      }
+    }
+  }
+  const rows = parsedFiles.flatMap(parsed => {
+    const sourceToTarget = new Map<string, string>();
+    parsed.headers.forEach(sourceHeader => {
+      const detectedRole = columnRole(sourceHeader, role);
+      const targetHeader = detectedRole ? headerByRole.get(detectedRole) : undefined;
+      const exactHeader = headers.find(header => normalizeColumnName(header) === normalizeColumnName(sourceHeader));
+      sourceToTarget.set(sourceHeader, exactHeader ?? targetHeader ?? sourceHeader);
+    });
+    return parsed.rows.map(sourceRow => {
+      const row: Record<string, unknown> = Object.fromEntries(headers.map(header => [header, ""]));
+      for (const [sourceHeader, value] of Object.entries(sourceRow)) {
+        const targetHeader = sourceToTarget.get(sourceHeader);
+        if (targetHeader) row[targetHeader] = value;
+      }
+      return row;
+    });
+  });
+  return { headers, rows, fileName: parsedFiles.map(parsed => parsed.fileName).join(" + ") };
+}
+
 // ─── DropZone ─────────────────────────────────────────────────────────────────
-function DropZone({ file, onFile, onClear, headers = [], rows = [] }: { file:File|null; onFile:(f:File)=>void; onClear:()=>void; headers?:string[]; rows?:Record<string, unknown>[] }) {
-  const handleDrop=useCallback((e:React.DragEvent)=>{e.preventDefault();const f=e.dataTransfer.files[0];if(f)onFile(f);},[onFile]);
+function DropZone({ file, fileCount = 1, onFiles, onClear, headers = [], rows = [] }: { file:File|null; fileCount?:number; onFiles:(files:File[], append?:boolean)=>void; onClear:()=>void; headers?:string[]; rows?:Record<string, unknown>[] }) {
+  const handleDrop=useCallback((e:React.DragEvent)=>{e.preventDefault();const files=Array.from(e.dataTransfer.files);if(files.length)onFiles(files);},[onFiles]);
   if (file) return (
     <div className="flex items-center justify-between gap-3 p-3.5 bg-blue-500/5 border border-blue-500/25 rounded-lg">
       <div className="flex items-center gap-2.5">
         <FileSpreadsheet className="w-4 h-4 text-blue-600 shrink-0"/>
-        <div><div className="text-sm font-medium">{file.name}</div><div className="text-xs text-muted-foreground">{(file.size/1024).toFixed(1)} KB</div></div>
+        <div><div className="text-sm font-medium">{fileCount > 1 ? `${fileCount} ملفات مدمجة` : file.name}</div><div className="text-xs text-muted-foreground">{fileCount > 1 ? `${rows.length} صفاً إجمالياً · ${file.name}` : `${(file.size/1024).toFixed(1)} KB`}</div></div>
       </div>
       {headers.length > 0 && rows.length > 0 && <button onClick={() => downloadCleanedSheet(file.name, headers, rows)} className="flex items-center gap-1 rounded-md bg-emerald-50 px-2 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100"><Download className="h-3.5 w-3.5"/>تنزيل Excel</button>}
+      <label className="cursor-pointer rounded-md border px-2 py-1.5 text-xs hover:bg-muted">إضافة ملفات للدمج
+        <input type="file" multiple accept=".xlsx,.xls,.csv" className="hidden" onChange={event=>{const files=Array.from(event.target.files ?? []);if(files.length)onFiles(files,true);event.currentTarget.value="";}}/>
+      </label>
       <button onClick={onClear} aria-label="حذف الملف" title="حذف الملف" className="p-1 hover:bg-muted rounded transition-colors text-muted-foreground"><X className="w-4 h-4"/></button>
     </div>
   );
   return (
     <label onDrop={handleDrop} onDragOver={e=>e.preventDefault()}
       className="flex flex-col items-center gap-2 p-6 border-2 border-dashed border-border rounded-lg cursor-pointer hover:border-blue-500/50 hover:bg-muted/10 transition-all">
-      <input type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={e=>{const f=e.target.files?.[0];if(f)onFile(f);e.currentTarget.value="";}}/>
+      <input type="file" multiple accept=".xlsx,.xls,.csv" className="hidden" onChange={e=>{const files=Array.from(e.target.files ?? []);if(files.length)onFiles(files);e.currentTarget.value="";}}/>
       <Upload className="w-6 h-6 text-muted-foreground"/>
-      <span className="text-sm">اسحب ملف الكشف أو انقر هنا</span>
-      <span className="text-xs text-muted-foreground">xlsx · xls · csv</span>
+      <span className="text-sm">اسحب ملفاً أو عدة ملفات للكشف أو انقر هنا</span>
+      <span className="text-xs text-muted-foreground">سيتم دمج الصفوف في كشف واحد · xlsx · xls · csv</span>
     </label>
   );
 }
@@ -2316,6 +2498,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   const [sessionRestoredNotice, setSessionRestoredNotice] = useState(false);
 
   const [bankFile, setBankFile]   = useState<File|null>(null);
+  const [bankFileCount, setBankFileCount] = useState(0);
   const [bankHeaders, setBankH]   = useState<string[]>([]);
   const [bankRowsRaw, setBankRows] = useState<Record<string,unknown>[]>([]);
   const [bankMap, setBankMap]     = useState({ date:"", desc:"", debit:"", credit:"", accountType:"", ref:"" });
@@ -2323,6 +2506,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   const [bankFileSessionId, setBankFileSessionId] = useState(0);
 
   const [cashFile, setCashFile]   = useState<File|null>(null);
+  const [cashFileCount, setCashFileCount] = useState(0);
   const [cashHeaders, setCashH]   = useState<string[]>([]);
   const [cashRowsRaw, setCashRows] = useState<Record<string,unknown>[]>([]);
   const [cashMap, setCashMap]     = useState({ date:"", name:"", debit:"", credit:"", accountType:"", ref:"" });
@@ -2330,18 +2514,21 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   const [cashFileSessionId, setCashFileSessionId] = useState(0);
   const [stageAInvoices, setStageAInvoices] = useState<StageAResult[]>([]);
   const [walletBankFile, setWalletBankFile] = useState<File|null>(null);
+  const [walletBankFileCount, setWalletBankFileCount] = useState(0);
   const [walletBankHeaders, setWalletBankHeaders] = useState<string[]>([]);
   const [walletBankRows, setWalletBankRows] = useState<Record<string,unknown>[]>([]);
   const [walletBankMap, setWalletBankMap] = useState({ date:"", desc:"", debit:"", credit:"", ref:"" });
   const [walletBankSwap, setWalletBankSwap] = useState(false);
   const [walletBankFileSessionId, setWalletBankFileSessionId] = useState(0);
   const [walletCashFile, setWalletCashFile] = useState<File|null>(null);
+  const [walletCashFileCount, setWalletCashFileCount] = useState(0);
   const [walletCashHeaders, setWalletCashHeaders] = useState<string[]>([]);
   const [walletCashRows, setWalletCashRows] = useState<Record<string,unknown>[]>([]);
   const [walletCashMap, setWalletCashMap] = useState({ date:"", name:"", debit:"", credit:"", ref:"" });
   const [walletCashSwap, setWalletCashSwap] = useState(false);
   const [walletCashFileSessionId, setWalletCashFileSessionId] = useState(0);
   const [jawwalBankFile, setJawwalBankFile] = useState<File|null>(null);
+  const [jawwalBankFileCount, setJawwalBankFileCount] = useState(0);
   const [jawwalBankHeaders, setJawwalBankHeaders] = useState<string[]>([]);
   const [jawwalBankRows, setJawwalBankRows] = useState<Record<string,unknown>[]>([]);
   const [jawwalBankMap, setJawwalBankMap] = useState({ date:"", desc:"", debit:"", credit:"", ref:"", totalAmount:"", movementAmount:"", direction:"" });
@@ -2349,6 +2536,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   const [jawwalBankOptions, setJawwalBankOptions] = useState({ useTotalAmount: true, readDebitCredit: true });
   const [jawwalBankFileSessionId, setJawwalBankFileSessionId] = useState(0);
   const [jawwalCashFile, setJawwalCashFile] = useState<File|null>(null);
+  const [jawwalCashFileCount, setJawwalCashFileCount] = useState(0);
   const [jawwalCashHeaders, setJawwalCashHeaders] = useState<string[]>([]);
   const [jawwalCashRows, setJawwalCashRows] = useState<Record<string,unknown>[]>([]);
   const [jawwalCashMap, setJawwalCashMap] = useState({ date:"", name:"", debit:"", credit:"", ref:"" });
@@ -2446,7 +2634,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         setJawwalBankHeaders(session.jawwalBankHeaders || []);
         setJawwalBankRows(session.jawwalBankRows || []);
         setJawwalBankMap({ date:"", desc:"", debit:"", credit:"", ref:"", totalAmount:"", movementAmount:"", direction:"", ...(session.jawwalBankMap || {}) });
-        setJawwalBankSwap(!!session.jawwalBankSwap);
+        setJawwalBankSwap(false);
         setJawwalBankOptions({ useTotalAmount: true, readDebitCredit: true, ...(session.jawwalBankOptions || {}) });
         setJawwalBankFileSessionId(session.jawwalBankFileSessionId ?? 0);
         setJawwalCashHeaders(session.jawwalCashHeaders || []);
@@ -2464,6 +2652,12 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         setWalletCashFileSnapshots(session.walletCashFileSnapshots || []);
         setJawwalBankFileSnapshots(session.jawwalBankFileSnapshots || []);
         setJawwalCashFileSnapshots(session.jawwalCashFileSnapshots || []);
+        setBankFileCount(session.bankFileSnapshots?.[0]?.fileCount ?? 0);
+        setCashFileCount(session.cashFileSnapshots?.[0]?.fileCount ?? 0);
+        setWalletBankFileCount(session.walletBankFileSnapshots?.[0]?.fileCount ?? 0);
+        setWalletCashFileCount(session.walletCashFileSnapshots?.[0]?.fileCount ?? 0);
+        setJawwalBankFileCount(session.jawwalBankFileSnapshots?.[0]?.fileCount ?? 0);
+        setJawwalCashFileCount(session.jawwalCashFileSnapshots?.[0]?.fileCount ?? 0);
         setManualGroups(session.manualGroups || []);
         setSavedMatches(session.savedMatches || []);
         setBankSplits(session.bankSplits || []);
@@ -2518,52 +2712,70 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     visaItems, heldItems, returnedHeldBank, returnedHeldCashier, rejectedSpecialCashierIds
   ]);
 
-  const loadBank=async(f:File)=>{
-    setBankFile(f);setError(null);setResults(null);
+  const loadBank=async(files:File[],append=false)=>{
+    setError(null);setResults(null);
     try {
-      const {headers,rows}=parseSheet(await readFileBuf(f));
+      const previous=append&&bankRowsRaw.length?{fileName:bankFileSnapshots[0]?.label??bankFile?.name??"الكشف السابق",headers:bankHeaders,rows:bankRowsRaw}:undefined;
+      const {headers,rows,fileName}=await parseAndMergeFiles(files,"bank",previous);
+      const mergedFileCount=(append&&bankRowsRaw.length?Math.max(1,bankFileCount):0)+files.length;
+      setBankFile(files[0]);setBankFileCount(mergedFileCount);
       setBankH(headers);setBankRows(rows);
       setBankMap({date:autoDetect(headers,HINTS.date),desc:autoDetect(headers,HINTS.desc),debit:autoDetect(headers,HINTS.debit),credit:autoDetect(headers,HINTS.credit),accountType:autoDetect(headers,HINTS.accountType),ref:autoDetect(headers,HINTS.ref)});
       setBankFileSessionId(id => id + 1);
-      setBankFileSnapshots(prev => [{ label: f.name, headers, rows, savedAt: new Date().toLocaleString("ar-SA") }, ...prev].slice(0, 5));
+      setBankFileSnapshots(prev => [{ label: fileName, headers, rows, savedAt: new Date().toLocaleString("ar-SA"), fileCount: mergedFileCount }, ...prev].slice(0, 5));
     } catch(e){setError((e as Error).message);}
   };
-  const loadCash=async(f:File)=>{
-    setCashFile(f);setError(null);setResults(null);
+  const loadCash=async(files:File[],append=false)=>{
+    setError(null);setResults(null);
     setRejectedSpecialCashierIds(new Set());
     try {
-      const {headers,rows}=parseSheet(await readFileBuf(f));
+      const previous=append&&cashRowsRaw.length?{fileName:cashFileSnapshots[0]?.label??cashFile?.name??"الكشف السابق",headers:cashHeaders,rows:cashRowsRaw}:undefined;
+      const {headers,rows,fileName}=await parseAndMergeFiles(files,"cash",previous);
+      const mergedFileCount=(append&&cashRowsRaw.length?Math.max(1,cashFileCount):0)+files.length;
+      setCashFile(files[0]);setCashFileCount(mergedFileCount);
       setCashH(headers);setCashRows(rows);
       setCashMap({date:autoDetect(headers,HINTS.date),name:autoDetect(headers,HINTS.name),debit:autoDetect(headers,HINTS.debit),credit:autoDetect(headers,HINTS.credit),accountType:autoDetect(headers,HINTS.accountType),ref:autoDetect(headers,HINTS.ref)});
       setCashFileSessionId(id => id + 1);
-      setCashFileSnapshots(prev => [{ label: f.name, headers, rows, savedAt: new Date().toLocaleString("ar-SA") }, ...prev].slice(0, 5));
+      setCashFileSnapshots(prev => [{ label: fileName, headers, rows, savedAt: new Date().toLocaleString("ar-SA"), fileCount: mergedFileCount }, ...prev].slice(0, 5));
     } catch(e){setError((e as Error).message);}
   };
-  const loadWalletBank = async (f: File) => {
-    setWalletBankFile(f); setError(null); setResults(null);
+  const loadWalletBank = async (files: File[], append=false) => {
+    setError(null); setResults(null);
     try {
-      const { headers, rows } = parseSheet(await readFileBuf(f));
+      const previous=append&&walletBankRows.length?{fileName:walletBankFileSnapshots[0]?.label??walletBankFile?.name??"الكشف السابق",headers:walletBankHeaders,rows:walletBankRows}:undefined;
+      const { headers, rows, fileName } = await parseAndMergeFiles(files,"bank",previous);
+      const mergedFileCount=(append&&walletBankRows.length?Math.max(1,walletBankFileCount):0)+files.length;
+      setWalletBankFile(files[0]);setWalletBankFileCount(mergedFileCount);
       setWalletBankHeaders(headers); setWalletBankRows(rows);
       setWalletBankMap({ date:autoDetect(headers,HINTS.date), desc:autoDetect(headers,HINTS.desc), debit:autoDetect(headers,HINTS.debit), credit:autoDetect(headers,HINTS.credit), ref:autoDetect(headers,HINTS.ref) });
       setWalletBankFileSessionId(id => id + 1);
-      setWalletBankFileSnapshots(prev => [{ label: f.name, headers, rows, savedAt: new Date().toLocaleString("ar-SA") }, ...prev].slice(0, 5));
+      setWalletBankFileSnapshots(prev => [{ label: fileName, headers, rows, savedAt: new Date().toLocaleString("ar-SA"), fileCount: mergedFileCount }, ...prev].slice(0, 5));
     } catch (e) { setError((e as Error).message); }
   };
-  const loadWalletCash = async (f: File) => {
-    setWalletCashFile(f); setError(null); setResults(null);
+  const loadWalletCash = async (files: File[], append=false) => {
+    setError(null); setResults(null);
     setRejectedSpecialCashierIds(new Set());
     try {
-      const { headers, rows } = parseSheet(await readFileBuf(f));
+      const previous=append&&walletCashRows.length?{fileName:walletCashFileSnapshots[0]?.label??walletCashFile?.name??"الكشف السابق",headers:walletCashHeaders,rows:walletCashRows}:undefined;
+      const { headers, rows, fileName } = await parseAndMergeFiles(files,"cash",previous);
+      const mergedFileCount=(append&&walletCashRows.length?Math.max(1,walletCashFileCount):0)+files.length;
+      setWalletCashFile(files[0]);setWalletCashFileCount(mergedFileCount);
       setWalletCashHeaders(headers); setWalletCashRows(rows);
       setWalletCashMap({ date:autoDetect(headers,HINTS.date), name:autoDetect(headers,HINTS.name), debit:autoDetect(headers,HINTS.debit), credit:autoDetect(headers,HINTS.credit), ref:autoDetect(headers,HINTS.ref) });
       setWalletCashFileSessionId(id => id + 1);
-      setWalletCashFileSnapshots(prev => [{ label: f.name, headers, rows, savedAt: new Date().toLocaleString("ar-SA") }, ...prev].slice(0, 5));
+      setWalletCashFileSnapshots(prev => [{ label: fileName, headers, rows, savedAt: new Date().toLocaleString("ar-SA"), fileCount: mergedFileCount }, ...prev].slice(0, 5));
     } catch (e) { setError((e as Error).message); }
   };
-  const loadJawwalBank = async (f: File) => {
-    setJawwalBankFile(f); setError(null); setResults(null);
+  const loadJawwalBank = async (files: File[], append=false) => {
+    setError(null); setResults(null);
     try {
-      const { headers, rows } = parseSheet(await readFileBuf(f));
+      const previous=append&&jawwalBankRows.length?{fileName:jawwalBankFileSnapshots[0]?.label??jawwalBankFile?.name??"الكشف السابق",headers:jawwalBankHeaders,rows:jawwalBankRows}:undefined;
+      const merged = await parseAndMergeFiles(files,"jawwalBank",previous);
+      const { headers, rows } = cleanJawwalPayLedger(merged.headers, merged.rows);
+      const { fileName } = merged;
+      const mergedFileCount=(append&&jawwalBankRows.length?Math.max(1,jawwalBankFileCount):0)+files.length;
+      setJawwalBankFile(files[0]);setJawwalBankFileCount(mergedFileCount);
+      setJawwalBankSwap(false);
       setJawwalBankHeaders(headers); setJawwalBankRows(rows);
       const totalAmount = autoDetect(headers, HINTS.totalAmount);
       const direction = autoDetect(headers, HINTS.direction);
@@ -2571,7 +2783,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       const credit = autoDetect(headers, HINTS.credit);
       setJawwalBankMap({
         date: autoDetect(headers, HINTS.date),
-        desc: autoDetect(headers, HINTS.desc),
+        desc: autoDetect(headers, ["بيان القيد", ...HINTS.desc]),
         debit: debit === direction ? "" : debit,
         credit: credit === direction ? "" : credit,
         ref: autoDetect(headers, HINTS.ref),
@@ -2580,26 +2792,29 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         direction,
       });
       setJawwalBankFileSessionId(id => id + 1);
-      setJawwalBankFileSnapshots(prev => [{ label: f.name, headers, rows, savedAt: new Date().toLocaleString("ar-SA") }, ...prev].slice(0, 5));
+      setJawwalBankFileSnapshots(prev => [{ label: fileName, headers, rows, savedAt: new Date().toLocaleString("ar-SA"), fileCount: mergedFileCount }, ...prev].slice(0, 5));
     } catch (e) { setError((e as Error).message); }
   };
-  const loadJawwalCash = async (f: File) => {
-    setJawwalCashFile(f); setError(null); setResults(null);
+  const loadJawwalCash = async (files: File[], append=false) => {
+    setError(null); setResults(null);
     try {
-      const { headers, rows } = parseSheet(await readFileBuf(f));
+      const previous=append&&jawwalCashRows.length?{fileName:jawwalCashFileSnapshots[0]?.label??jawwalCashFile?.name??"الكشف السابق",headers:jawwalCashHeaders,rows:jawwalCashRows}:undefined;
+      const { headers, rows, fileName } = await parseAndMergeFiles(files,"cash",previous);
+      const mergedFileCount=(append&&jawwalCashRows.length?Math.max(1,jawwalCashFileCount):0)+files.length;
+      setJawwalCashFile(files[0]);setJawwalCashFileCount(mergedFileCount);
       setJawwalCashHeaders(headers); setJawwalCashRows(rows);
       setJawwalCashMap({ date:autoDetect(headers,HINTS.date), name:autoDetect(headers,HINTS.name), debit:autoDetect(headers,HINTS.debit), credit:autoDetect(headers,HINTS.credit), ref:autoDetect(headers,HINTS.ref) });
       setJawwalCashFileSessionId(id => id + 1);
-      setJawwalCashFileSnapshots(prev => [{ label: f.name, headers, rows, savedAt: new Date().toLocaleString("ar-SA") }, ...prev].slice(0, 5));
+      setJawwalCashFileSnapshots(prev => [{ label: fileName, headers, rows, savedAt: new Date().toLocaleString("ar-SA"), fileCount: mergedFileCount }, ...prev].slice(0, 5));
     } catch (e) { setError((e as Error).message); }
   };
-  const loadCustomSource = async (platformId: number, slot: "transfer" | "invoice", file: File) => {
+  const loadCustomSource = async (platformId: number, slot: "transfer" | "invoice", files: File[]) => {
     setError(null);
     setResults(null);
     try {
-      const { headers, rows } = parseSheet(await readFileBuf(file));
+      const { headers, rows, fileName } = await parseAndMergeFiles(files,slot === "invoice" ? "cash" : "bank");
       const source: PlatformSource = {
-        fileName: file.name,
+        fileName,
         headers,
         rows,
         map: {
@@ -2671,7 +2886,12 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     return { id: 2000000 + i, rawName, name, notes, splitExpr, debit, credit, amount, matchAmount:ma ?? amount, type, accountType:platformNames.wallet, ref:String(walletCashMap.ref ? r[walletCashMap.ref] : "").trim(), date:fmtDate(walletCashMap.date ? r[walletCashMap.date] : ""), orig:r, _fileSessionId:walletCashFileSessionId };
   }).filter((r): r is CashierRow => r !== null), [walletCashRows, walletCashMap, walletCashSwap, platformNames.wallet, walletCashFileSessionId]);
 
+  const cleanedJawwalBankDataset = useMemo(
+    () => cleanJawwalPayLedger(jawwalBankHeaders, jawwalBankRows),
+    [jawwalBankHeaders, jawwalBankRows]
+  );
   const parseJawwalBankRows = useMemo(():BankRow[] => jawwalBankRows.map((r,i): BankRow | null => {
+    if (!isJawwalPayLedgerMovement(jawwalBankHeaders, r)) return null;
     const original = resolveDebitCredit(r, jawwalBankMap.debit, jawwalBankMap.credit, false);
     const amountColumn = jawwalBankOptions.useTotalAmount ? jawwalBankMap.totalAmount : jawwalBankMap.movementAmount;
     const useMappedAmount = !!amountColumn;
@@ -2679,20 +2899,25 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     const direction = jawwalBankOptions.readDebitCredit && jawwalBankMap.direction
       ? String(r[jawwalBankMap.direction] ?? "").trim().toLowerCase()
       : "";
+    const transactionTypeColumn = autoDetect(jawwalBankHeaders, ["نوع الحركة", "transaction type"]);
+    const transactionType = transactionTypeColumn ? String(r[transactionTypeColumn] ?? "").trim().toLowerCase() : "";
     const isCredit = /دائن|credit/.test(direction);
     const isDebit = /مدين|debit/.test(direction);
-    const type: BankRow["type"] = isCredit ? "مدفوع" : isDebit ? "مستلم" : original.type;
-    let debit = isDebit ? amount : isCredit ? 0 : useMappedAmount ? type === "مستلم" ? amount : 0 : original.debit;
-    let credit = isCredit ? amount : isDebit ? 0 : useMappedAmount ? type === "مدفوع" ? amount : 0 : original.credit;
+    const isMerchantPayment = /pay\s+to\s+merchant|دفع(?:ة)?\s+(?:إلى|الى|لدى|للتاجر)/i.test(transactionType);
+    const type: BankRow["type"] = isMerchantPayment ? "مستلم" : original.rawAmount > 0
+      ? original.type
+      : isCredit ? "مدفوع" : isDebit ? "مستلم" : original.type;
+    let debit = type === "مستلم" ? amount : 0;
+    let credit = type === "مدفوع" ? amount : 0;
     let finalType = type;
-    if (jawwalBankSwap) {
+    if (jawwalBankSwap && !isMerchantPayment) {
       [debit, credit] = [credit, debit];
       finalType = type === "مدفوع" ? "مستلم" : "مدفوع";
     }
     const rawAmount = amount;
     if (!rawAmount) return null;
     return { id: 4000000 + i, date:fmtDate(jawwalBankMap.date ? r[jawwalBankMap.date] : ""), description:String(jawwalBankMap.desc ? r[jawwalBankMap.desc] : "").trim(), debit, credit, rawAmount, type:finalType, accountType:platformNames.jawwal, ref:String(jawwalBankMap.ref ? r[jawwalBankMap.ref] : "").trim(), orig:r, _fileSessionId:jawwalBankFileSessionId };
-  }).filter((r): r is BankRow => r !== null), [jawwalBankRows, jawwalBankMap, jawwalBankSwap, jawwalBankOptions, jawwalBankFileSessionId, platformNames.jawwal]);
+  }).filter((r): r is BankRow => r !== null), [jawwalBankRows, jawwalBankHeaders, jawwalBankMap, jawwalBankSwap, jawwalBankOptions, jawwalBankFileSessionId, platformNames.jawwal]);
 
   const parsedJawwalCashier = useMemo(():CashierRow[] => jawwalCashRows.map((r,i): CashierRow | null => {
     const rawName = String(jawwalCashMap.name ? r[jawwalCashMap.name] : "").trim();
@@ -2963,7 +3188,10 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     [results]
   );
   const pendingRows = useMemo(
-    () => (results?.filter(r => r.type === "pending") as any[] ?? []).sort((a,b) => b.bank.rawAmount - a.bank.rawAmount),
+    () => (results?.filter(r => r.type === "pending") as any[] ?? []).sort((a,b) =>
+      Number(b.matchType === "phone") - Number(a.matchType === "phone") ||
+      b.bank.rawAmount - a.bank.rawAmount
+    ),
     [results]
   );
   const visaRows = useMemo(() => results?.filter(r => r.type === "visa") as any[] ?? [], [results]);
@@ -2998,9 +3226,9 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
 
   const rerun = useCallback(() => {
     if (!reconciliationBankRows.length || !reconciliationCashierRows.length) return;
-    const res = reconcile(reconciliationBankRows, reconciliationCashierRows, manualGroups, savedMatches, rejectedPairs, visaCashierIds, jawwalPayCashierIds, mahmoudWalletCashierIds, amountTolerancePercent, nameAliases);
+    const res = reconcile(reconciliationBankRows, reconciliationCashierRows, manualGroups, savedMatches, rejectedPairs, visaCashierIds, jawwalPayCashierIds, mahmoudWalletCashierIds, amountTolerancePercent, nameAliases, platformNames.jawwal);
     setResults(res);
-  }, [reconciliationBankRows, reconciliationCashierRows, manualGroups, savedMatches, rejectedPairs, visaCashierIds, jawwalPayCashierIds, mahmoudWalletCashierIds, amountTolerancePercent, nameAliases]);
+  }, [reconciliationBankRows, reconciliationCashierRows, manualGroups, savedMatches, rejectedPairs, visaCashierIds, jawwalPayCashierIds, mahmoudWalletCashierIds, amountTolerancePercent, nameAliases, platformNames.jawwal]);
 
   const run = async() => {
     setLoading(true); setError(null);
@@ -3009,7 +3237,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         setError("كل حركات البنك مصنّفة كمعلّقات غير تابعة للمطابقة.");
         return;
       }
-      const res = reconcile(reconciliationBankRows, reconciliationCashierRows, manualGroups, savedMatches, rejectedPairs, visaCashierIds, jawwalPayCashierIds, mahmoudWalletCashierIds, amountTolerancePercent, nameAliases);
+      const res = reconcile(reconciliationBankRows, reconciliationCashierRows, manualGroups, savedMatches, rejectedPairs, visaCashierIds, jawwalPayCashierIds, mahmoudWalletCashierIds, amountTolerancePercent, nameAliases, platformNames.jawwal);
       setResults(res);
       setTab("saved");
       setToast(`تمت مطابقة ${res.filter(r => r.type === "pending" || r.type === "saved").length} سجل`);
@@ -3063,14 +3291,25 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   ): SavedMatch | null => {
     const pairKey = `${cashierRow.id}-${bankRow.id}`;
     if (savedKeys.has(pairKey) && !options?.force) return null;
+    const phone = extractMobileNumber(`${cashierRow.rawName} ${cashierRow.name}`);
+    const cashierIsJawwal = cashierRow.accountType.trim().toLocaleLowerCase() === platformNames.jawwal.trim().toLocaleLowerCase();
+    const bankIsJawwal = bankRow.accountType.trim().toLocaleLowerCase() === platformNames.jawwal.trim().toLocaleLowerCase();
+    const hasPhoneMatch = cashierIsJawwal && bankIsJawwal && !!phone && phone === extractMobileNumber(bankRow.description);
+    if (cashierIsJawwal || bankIsJawwal) {
+      if (!hasPhoneMatch || Math.abs(bankRow.rawAmount - cashierRow.matchAmount) > 0.01) {
+        setToast("لا يمكن مطابقة حركة جوال بي إلا عند تطابق رقم الجوال والمبلغ.");
+        return null;
+      }
+    }
     skipNextAutoReconcile.current = true;
 
     const isAmountDiff = Math.abs(bankRow.rawAmount - cashierRow.amount) > 0.01;
     const ms = advancedMatchCheck(cashierRow.name, bankRow.description);
-    const isNameDiff = ms.isApprox || ms.matchType === "none";
+    const isNameDiff = !hasPhoneMatch && (ms.isApprox || ms.matchType === "none");
     const isAccountTypeDiff = accountTypesDiffer(bankRow.accountType, cashierRow.accountType);
 
     const autoNote = note || [
+      hasPhoneMatch ? `مطابقة برقم الجوال: ${phone}` : "",
       isAmountDiff ? `اختلاف مبلغ: ${fmtNum(Math.abs(bankRow.rawAmount - cashierRow.amount))}` : "",
       isNameDiff ? `اختلاف اسم: ${cashierRow.name} ↔ ${bankRow.description}` : "",
       isAccountTypeDiff ? `نوع الحساب مختلف: بنك (${bankRow.accountType || "—"}) ↔ كاشير (${cashierRow.accountType || "—"})` : ""
@@ -3084,7 +3323,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       date: new Date().toLocaleDateString("ar-SA"),
       savedAt: new Date().toLocaleString("ar-SA"),
       note: autoNote, isAmountDiff, isNameDiff, isManual: false, isAccountTypeDiff,
-      matchScore: Math.round(nameSim(cashierRow.name, bankRow.description) * 100),
+      matchScore: hasPhoneMatch ? 100 : Math.round(nameSim(cashierRow.name, bankRow.description) * 100),
       editorNotes: note,
       bankAccountType: bankRow.accountType, cashierAccountType: cashierRow.accountType
     };
@@ -3405,6 +3644,20 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   };
 
   const handleAddGroup = (g: ManualMatchGroup) => {
+    const jawwalAccountKey = platformNames.jawwal.trim().toLocaleLowerCase();
+    const jawwalBanks = g.banks.filter(row => row.accountType.trim().toLocaleLowerCase() === jawwalAccountKey);
+    const jawwalCashiers = g.cashiers.filter(row => row.accountType.trim().toLocaleLowerCase() === jawwalAccountKey);
+    if (jawwalBanks.length || jawwalCashiers.length) {
+      const bank = jawwalBanks[0];
+      const cashier = jawwalCashiers[0];
+      const phone = cashier && extractMobileNumber(`${cashier.rawName} ${cashier.name}`);
+      if (g.banks.length !== 1 || g.cashiers.length !== 1 || !bank || !cashier
+        || !phone || phone !== extractMobileNumber(bank.description)
+        || Math.abs(bank.rawAmount - cashier.matchAmount) > 0.01) {
+        setToast("مطابقة جوال بي تتطلب حركة واحدة من كل ملف مع تطابق رقم الجوال والمبلغ.");
+        return;
+      }
+    }
     const newSaved: SavedMatch[] = [];
     g.banks.forEach(b => {
       g.cashiers.forEach(c => {
@@ -3782,7 +4035,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     setWalletCashSwap(p.walletCashSwap ?? false); setWalletCashFileSessionId(p.walletCashFileSessionId ?? 0);
     setJawwalBankHeaders(p.jawwalBankHeaders ?? []); setJawwalBankRows(p.jawwalBankRows ?? []);
     setJawwalBankMap({ date: p.jawwalBankMap?.date ?? "", desc: p.jawwalBankMap?.desc ?? "", debit: p.jawwalBankMap?.debit ?? "", credit: p.jawwalBankMap?.credit ?? "", ref: p.jawwalBankMap?.ref ?? "", totalAmount: p.jawwalBankMap?.totalAmount ?? "", movementAmount: p.jawwalBankMap?.movementAmount ?? "", direction: p.jawwalBankMap?.direction ?? "" });
-    setJawwalBankSwap(p.jawwalBankSwap ?? false); setJawwalBankOptions({ useTotalAmount: true, readDebitCredit: true, ...(p.jawwalBankOptions ?? {}) });
+    setJawwalBankSwap(false); setJawwalBankOptions({ useTotalAmount: true, readDebitCredit: true, ...(p.jawwalBankOptions ?? {}) });
     setJawwalBankFileSessionId(p.jawwalBankFileSessionId ?? 0);
     setJawwalCashHeaders(p.jawwalCashHeaders ?? []); setJawwalCashRows(p.jawwalCashRows ?? []);
     setJawwalCashMap({ date: p.jawwalCashMap?.date ?? "", name: p.jawwalCashMap?.name ?? "", debit: p.jawwalCashMap?.debit ?? "", credit: p.jawwalCashMap?.credit ?? "", ref: p.jawwalCashMap?.ref ?? "" });
@@ -3800,6 +4053,12 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     setWalletCashFileSnapshots(p.walletCashFileSnapshots ?? []);
     setJawwalBankFileSnapshots(p.jawwalBankFileSnapshots ?? []);
     setJawwalCashFileSnapshots(p.jawwalCashFileSnapshots ?? []);
+    setBankFileCount(p.bankFileSnapshots?.[0]?.fileCount ?? 0);
+    setCashFileCount(p.cashFileSnapshots?.[0]?.fileCount ?? 0);
+    setWalletBankFileCount(p.walletBankFileSnapshots?.[0]?.fileCount ?? 0);
+    setWalletCashFileCount(p.walletCashFileSnapshots?.[0]?.fileCount ?? 0);
+    setJawwalBankFileCount(p.jawwalBankFileSnapshots?.[0]?.fileCount ?? 0);
+    setJawwalCashFileCount(p.jawwalCashFileSnapshots?.[0]?.fileCount ?? 0);
     setRejected(new Set(p.rejectedPairs));
     setVisaItems(p.visaItems ?? []);
     setHeldItems(dedupeHeldItems(p.heldItems ?? []));
@@ -3834,36 +4093,45 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     setToast("تم إلغاء جميع المطابقات المؤكدة، بما فيها المطابقات اليدوية");
   };
 
-  const handleClearSession = () => {
-    if (!window.confirm("مسح الجلسة الحالية كاملة؟\nهاد بيحذف: الملفات (بكل المنصات)، الملفات المحفوظة للاسترجاع، المطابقات، الفيزا، المعلقات، والرفوض.\nالمشاريع المحفوظة رح تضل محفوظة.")) return;
-    setBankH([]); setBankRows([]); setBankMap({date:"",desc:"",debit:"",credit:"",accountType:"",ref:""}); setBankSwap(false); setBankFile(null); setBankFileSessionId(0);
-    setCashH([]); setCashRows([]); setCashMap({date:"",name:"",debit:"",credit:"",accountType:"",ref:""}); setCashSwap(false); setCashFile(null); setCashFileSessionId(0); setStageAInvoices([]);
-    setWalletBankFile(null); setWalletBankHeaders([]); setWalletBankRows([]); setWalletBankMap({date:"",desc:"",debit:"",credit:"",ref:""}); setWalletBankSwap(false);
-    setWalletCashFile(null); setWalletCashHeaders([]); setWalletCashRows([]); setWalletCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setWalletCashSwap(false);
+  const handleClearSession = (preserveHeldItems = false) => {
+    const heldCount = heldItems.length;
+    const message = preserveHeldItems
+      ? `مسح ملفات وبيانات الجلسة الحالية مع الإبقاء على المعلّقات (${heldCount})؟\nسيتم حذف الكشوف والملفات المحفوظة للاسترجاع والمطابقات والفيزا والرفض، وستبقى الحركات المعلّقة لمتابعتها مع كشف اليوم التالي.`
+      : "مسح الجلسة الحالية كاملة؟\nهاد بيحذف: الملفات (بكل المنصات)، الملفات المحفوظة للاسترجاع، المطابقات، الفيزا، المعلقات، والرفوض.\nالمشاريع المحفوظة رح تضل محفوظة.";
+    if (!window.confirm(message)) return;
+    setBankH([]); setBankRows([]); setBankMap({date:"",desc:"",debit:"",credit:"",accountType:"",ref:""}); setBankSwap(false); setBankFile(null); setBankFileCount(0); setBankFileSessionId(0);
+    setCashH([]); setCashRows([]); setCashMap({date:"",name:"",debit:"",credit:"",accountType:"",ref:""}); setCashSwap(false); setCashFile(null); setCashFileCount(0); setCashFileSessionId(0); setStageAInvoices([]);
+    setWalletBankFile(null); setWalletBankFileCount(0); setWalletBankHeaders([]); setWalletBankRows([]); setWalletBankMap({date:"",desc:"",debit:"",credit:"",ref:""}); setWalletBankSwap(false);
+    setWalletCashFile(null); setWalletCashFileCount(0); setWalletCashHeaders([]); setWalletCashRows([]); setWalletCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setWalletCashSwap(false);
     setWalletBankFileSessionId(id => id + 1); setWalletCashFileSessionId(id => id + 1); setJawwalBankFileSessionId(id => id + 1); setJawwalCashFileSessionId(id => id + 1);
-    setJawwalBankFile(null); setJawwalBankHeaders([]); setJawwalBankRows([]); setJawwalBankMap({date:"",desc:"",debit:"",credit:"",ref:"",totalAmount:"",movementAmount:"",direction:""}); setJawwalBankSwap(false); setJawwalBankOptions({useTotalAmount:true,readDebitCredit:true});
-    setJawwalCashFile(null); setJawwalCashHeaders([]); setJawwalCashRows([]); setJawwalCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setJawwalCashSwap(false);
+    setJawwalBankFile(null); setJawwalBankFileCount(0); setJawwalBankHeaders([]); setJawwalBankRows([]); setJawwalBankMap({date:"",desc:"",debit:"",credit:"",ref:"",totalAmount:"",movementAmount:"",direction:""}); setJawwalBankSwap(false); setJawwalBankOptions({useTotalAmount:true,readDebitCredit:true});
+    setJawwalCashFile(null); setJawwalCashFileCount(0); setJawwalCashHeaders([]); setJawwalCashRows([]); setJawwalCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setJawwalCashSwap(false);
     setPlatformNames({ bank: "بنك فلسطين", wallet: "بال بي", jawwal: "جوال بي" }); setCustomPlatforms([]); nextCustomPlatformId.current = 0;
     setBankFileSnapshots([]); setCashFileSnapshots([]);
     setWalletBankFileSnapshots([]); setWalletCashFileSnapshots([]);
     setJawwalBankFileSnapshots([]); setJawwalCashFileSnapshots([]);
     setManualGroups([]); setSavedMatches([]); setRejected(new Set());
     setBankSplits([]); setCutoffBatches([]); setClearingGroups([]);
-    setVisaItems([]); setHeldItems([]); setReturnedHeldBank([]); setReturnedHeldCashier([]);
+    setVisaItems([]);
+    if (!preserveHeldItems) setHeldItems([]);
+    setReturnedHeldBank([]); setReturnedHeldCashier([]);
     setRejectedSpecialCashierIds(new Set());
     setResults(null); setTab("saved");
     setSessionRestoredNotice(false);
     setShowDeleteMenu(false);
+    setToast(preserveHeldItems
+      ? `تم مسح الجلسة والإبقاء على ${heldCount} حركة معلّقة. ارفع كشف اليوم التالي لمتابعتها.`
+      : "تم مسح الجلسة الحالية كاملة.");
   };
 
   const handleClearPlatform = (plat: "bank" | "cash" | "walletBank" | "walletCash" | "jawwalBank" | "jawwalCash") => {
     if (!window.confirm("مسح ملف هذه المنصة والملفات المحفوظة للاسترجاع الخاصة بها فقط؟\nباقي المنصات والمطابقات المؤكدة رح تضل كما هي.")) return;
-    if (plat === "bank") { setBankFile(null); setBankH([]); setBankRows([]); setBankMap({date:"",desc:"",debit:"",credit:"",accountType:"",ref:""}); setBankSwap(false); setBankFileSessionId(id => id + 1); setBankFileSnapshots([]); }
-    if (plat === "cash") { setCashFile(null); setCashH([]); setCashRows([]); setCashMap({date:"",name:"",debit:"",credit:"",accountType:"",ref:""}); setCashSwap(false); setCashFileSessionId(id => id + 1); setCashFileSnapshots([]); }
-    if (plat === "walletBank") { setWalletBankFile(null); setWalletBankHeaders([]); setWalletBankRows([]); setWalletBankMap({date:"",desc:"",debit:"",credit:"",ref:""}); setWalletBankSwap(false); setWalletBankFileSessionId(id => id + 1); setWalletBankFileSnapshots([]); }
-    if (plat === "walletCash") { setWalletCashFile(null); setWalletCashHeaders([]); setWalletCashRows([]); setWalletCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setWalletCashSwap(false); setWalletCashFileSessionId(id => id + 1); setWalletCashFileSnapshots([]); }
-    if (plat === "jawwalBank") { setJawwalBankFile(null); setJawwalBankHeaders([]); setJawwalBankRows([]); setJawwalBankMap({date:"",desc:"",debit:"",credit:"",ref:"",totalAmount:"",movementAmount:"",direction:""}); setJawwalBankSwap(false); setJawwalBankOptions({useTotalAmount:true,readDebitCredit:true}); setJawwalBankFileSessionId(id => id + 1); setJawwalBankFileSnapshots([]); }
-    if (plat === "jawwalCash") { setJawwalCashFile(null); setJawwalCashHeaders([]); setJawwalCashRows([]); setJawwalCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setJawwalCashSwap(false); setJawwalCashFileSessionId(id => id + 1); setJawwalCashFileSnapshots([]); }
+    if (plat === "bank") { setBankFile(null); setBankFileCount(0); setBankH([]); setBankRows([]); setBankMap({date:"",desc:"",debit:"",credit:"",accountType:"",ref:""}); setBankSwap(false); setBankFileSessionId(id => id + 1); setBankFileSnapshots([]); }
+    if (plat === "cash") { setCashFile(null); setCashFileCount(0); setCashH([]); setCashRows([]); setCashMap({date:"",name:"",debit:"",credit:"",accountType:"",ref:""}); setCashSwap(false); setCashFileSessionId(id => id + 1); setCashFileSnapshots([]); }
+    if (plat === "walletBank") { setWalletBankFile(null); setWalletBankFileCount(0); setWalletBankHeaders([]); setWalletBankRows([]); setWalletBankMap({date:"",desc:"",debit:"",credit:"",ref:""}); setWalletBankSwap(false); setWalletBankFileSessionId(id => id + 1); setWalletBankFileSnapshots([]); }
+    if (plat === "walletCash") { setWalletCashFile(null); setWalletCashFileCount(0); setWalletCashHeaders([]); setWalletCashRows([]); setWalletCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setWalletCashSwap(false); setWalletCashFileSessionId(id => id + 1); setWalletCashFileSnapshots([]); }
+    if (plat === "jawwalBank") { setJawwalBankFile(null); setJawwalBankFileCount(0); setJawwalBankHeaders([]); setJawwalBankRows([]); setJawwalBankMap({date:"",desc:"",debit:"",credit:"",ref:"",totalAmount:"",movementAmount:"",direction:""}); setJawwalBankSwap(false); setJawwalBankOptions({useTotalAmount:true,readDebitCredit:true}); setJawwalBankFileSessionId(id => id + 1); setJawwalBankFileSnapshots([]); }
+    if (plat === "jawwalCash") { setJawwalCashFile(null); setJawwalCashFileCount(0); setJawwalCashHeaders([]); setJawwalCashRows([]); setJawwalCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setJawwalCashSwap(false); setJawwalCashFileSessionId(id => id + 1); setJawwalCashFileSnapshots([]); }
     setResults(null);
     setToast("تم مسح بيانات هذه المنصة ✓");
   };
@@ -3912,7 +4180,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     setWalletCashSwap(p.walletCashSwap ?? false); setWalletCashFileSessionId(p.walletCashFileSessionId ?? 0);
     setJawwalBankHeaders(p.jawwalBankHeaders ?? []); setJawwalBankRows(p.jawwalBankRows ?? []);
     setJawwalBankMap({ date: p.jawwalBankMap?.date ?? "", desc: p.jawwalBankMap?.desc ?? "", debit: p.jawwalBankMap?.debit ?? "", credit: p.jawwalBankMap?.credit ?? "", ref: p.jawwalBankMap?.ref ?? "", totalAmount: p.jawwalBankMap?.totalAmount ?? "", movementAmount: p.jawwalBankMap?.movementAmount ?? "", direction: p.jawwalBankMap?.direction ?? "" });
-    setJawwalBankSwap(p.jawwalBankSwap ?? false); setJawwalBankOptions({ useTotalAmount: true, readDebitCredit: true, ...(p.jawwalBankOptions ?? {}) });
+    setJawwalBankSwap(false); setJawwalBankOptions({ useTotalAmount: true, readDebitCredit: true, ...(p.jawwalBankOptions ?? {}) });
     setJawwalBankFileSessionId(p.jawwalBankFileSessionId ?? 0);
     setJawwalCashHeaders(p.jawwalCashHeaders ?? []); setJawwalCashRows(p.jawwalCashRows ?? []);
     setJawwalCashMap({ date: p.jawwalCashMap?.date ?? "", name: p.jawwalCashMap?.name ?? "", debit: p.jawwalCashMap?.debit ?? "", credit: p.jawwalCashMap?.credit ?? "", ref: p.jawwalCashMap?.ref ?? "" });
@@ -3934,6 +4202,12 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     setWalletCashFileSnapshots(p.walletCashFileSnapshots ?? []);
     setJawwalBankFileSnapshots(p.jawwalBankFileSnapshots ?? []);
     setJawwalCashFileSnapshots(p.jawwalCashFileSnapshots ?? []);
+    setBankFileCount(p.bankFileSnapshots?.[0]?.fileCount ?? 0);
+    setCashFileCount(p.cashFileSnapshots?.[0]?.fileCount ?? 0);
+    setWalletBankFileCount(p.walletBankFileSnapshots?.[0]?.fileCount ?? 0);
+    setWalletCashFileCount(p.walletCashFileSnapshots?.[0]?.fileCount ?? 0);
+    setJawwalBankFileCount(p.jawwalBankFileSnapshots?.[0]?.fileCount ?? 0);
+    setJawwalCashFileCount(p.jawwalCashFileSnapshots?.[0]?.fileCount ?? 0);
     setRejected(new Set(p.rejectedPairs || []));
     setVisaItems(p.visaItems || []);
     setHeldItems(dedupeHeldItems(p.heldItems || []));
@@ -4128,9 +4402,20 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     });
   };
   const allPendingSelected = pendingRows.length > 0 && pendingRows.every((r:any) => selectedPendingKeys.has(`${r.cashier.id}-${r.bank.id}`));
+  const currentPagePendingKeys = pagedPendingRows.map((row: any) => `${row.cashier.id}-${row.bank.id}`);
+  const allCurrentPagePendingSelected = currentPagePendingKeys.length > 0 &&
+    currentPagePendingKeys.every(key => selectedPendingKeys.has(key));
   const togglePendingSelectAll = () => {
     if (allPendingSelected) { setSelectedPendingKeys(new Set()); return; }
     setSelectedPendingKeys(new Set(pendingRows.map((r:any) => `${r.cashier.id}-${r.bank.id}`)));
+  };
+  const toggleCurrentPagePendingSelection = () => {
+    setSelectedPendingKeys(previous => {
+      const next = new Set(previous);
+      if (allCurrentPagePendingSelected) currentPagePendingKeys.forEach(key => next.delete(key));
+      else currentPagePendingKeys.forEach(key => next.add(key));
+      return next;
+    });
   };
   const handleSaveSelectedPending = () => {
     const pairs = pendingRows
@@ -4239,10 +4524,17 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                       <span>مسح المطابقات المؤكدة</span>
                       <span className="text-muted-foreground mr-auto">{savedMatches.length}</span>
                     </button>
-                    <button onClick={handleClearSession}
+                    <button onClick={() => handleClearSession()}
                       className="w-full text-right px-4 py-2.5 hover:bg-amber-50 flex items-center gap-2 transition-colors border-t border-border">
                       <RotateCcw className="w-3.5 h-3.5 text-amber-600"/>
                       <span>مسح الجلسة الحالية كاملة</span>
+                    </button>
+                    <button onClick={() => handleClearSession(true)}
+                      disabled={!heldItems.length}
+                      className="w-full text-right px-4 py-2.5 hover:bg-blue-50 flex items-center gap-2 disabled:opacity-40 transition-colors border-t border-border">
+                      <RotateCcw className="w-3.5 h-3.5 text-blue-600"/>
+                      <span>مسح الجلسة مع إبقاء المعلّقات</span>
+                      <span className="mr-auto text-muted-foreground">{heldItems.length}</span>
                     </button>
                     <button onClick={handleDeleteAllProjects}
                       className="w-full text-right px-4 py-2.5 hover:bg-red-50 flex items-center gap-2 transition-colors border-t border-border">
@@ -4318,7 +4610,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                 </button>
               )}
             </div>
-            <DropZone file={bankFile} onFile={loadBank} onClear={() => { setBankFile(null); setBankH([]); setBankRows([]); setResults(null); }} headers={bankHeaders} rows={bankRowsRaw} />
+            <DropZone file={bankFile} fileCount={bankFileCount} onFiles={loadBank} onClear={() => { setBankFile(null); setBankFileCount(0); setBankH([]); setBankRows([]); setResults(null); }} headers={bankHeaders} rows={bankRowsRaw} />
             {bankHeaders.length > 0 && (
               <div className="grid grid-cols-2 gap-2">
                 <Sel label="التاريخ" headers={bankHeaders} value={bankMap.date} onChange={v => setBankMap(m => ({ ...m, date: v }))} />
@@ -4347,6 +4639,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                     <div className="absolute left-0 mt-1 w-72 bg-card border border-border rounded-lg shadow-lg z-20 py-1 text-xs max-h-72 overflow-y-auto">
                       {bankFileSnapshots.map((s, i) => (
                         <button key={i} onClick={() => {
+                          setBankFileCount(s.fileCount ?? 1);
                           setBankH(s.headers); setBankRows(s.rows);
                           setBankMap({ date:autoDetect(s.headers,HINTS.date), desc:autoDetect(s.headers,HINTS.desc), debit:autoDetect(s.headers,HINTS.debit), credit:autoDetect(s.headers,HINTS.credit), accountType:autoDetect(s.headers,HINTS.accountType), ref:autoDetect(s.headers,HINTS.ref) });
                           setBankFileSessionId(id => id + 1);
@@ -4375,7 +4668,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                 </button>
               )}
             </div>
-            <DropZone file={cashFile} onFile={loadCash} onClear={() => { setCashFile(null); setCashH([]); setCashRows([]); setResults(null); }} headers={cashHeaders} rows={cashRowsRaw} />
+            <DropZone file={cashFile} fileCount={cashFileCount} onFiles={loadCash} onClear={() => { setCashFile(null); setCashFileCount(0); setCashH([]); setCashRows([]); setResults(null); }} headers={cashHeaders} rows={cashRowsRaw} />
             {cashHeaders.length > 0 && (
               <div className="grid grid-cols-2 gap-2">
                 <Sel label="التاريخ" headers={cashHeaders} value={cashMap.date} onChange={v => setCashMap(m => ({ ...m, date: v }))} />
@@ -4404,6 +4697,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                     <div className="absolute left-0 mt-1 w-72 bg-card border border-border rounded-lg shadow-lg z-20 py-1 text-xs max-h-72 overflow-y-auto">
                       {cashFileSnapshots.map((s, i) => (
                         <button key={i} onClick={() => {
+                          setCashFileCount(s.fileCount ?? 1);
                           setCashH(s.headers); setCashRows(s.rows);
                           setCashMap({ date:autoDetect(s.headers,HINTS.date), name:autoDetect(s.headers,HINTS.name), debit:autoDetect(s.headers,HINTS.debit), credit:autoDetect(s.headers,HINTS.credit), accountType:autoDetect(s.headers,HINTS.accountType), ref:autoDetect(s.headers,HINTS.ref) });
                           setCashFileSessionId(id => id + 1);
@@ -4432,7 +4726,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                 </button>
               )}
             </div>
-            <DropZone file={walletBankFile} onFile={loadWalletBank} onClear={() => { setWalletBankFile(null); setWalletBankHeaders([]); setWalletBankRows([]); setResults(null); }} headers={walletBankHeaders} rows={walletBankRows} />
+            <DropZone file={walletBankFile} fileCount={walletBankFileCount} onFiles={loadWalletBank} onClear={() => { setWalletBankFile(null); setWalletBankFileCount(0); setWalletBankHeaders([]); setWalletBankRows([]); setResults(null); }} headers={walletBankHeaders} rows={walletBankRows} />
             {walletBankHeaders.length > 0 && <div className="grid grid-cols-2 gap-2">
               <Sel label="التاريخ" headers={walletBankHeaders} value={walletBankMap.date} onChange={v => setWalletBankMap(m => ({ ...m, date:v }))} />
               <Sel label="الإيضاحات / البيان" headers={walletBankHeaders} value={walletBankMap.desc} onChange={v => setWalletBankMap(m => ({ ...m, desc:v }))} />
@@ -4458,6 +4752,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                     <div className="absolute left-0 mt-1 w-72 bg-card border border-border rounded-lg shadow-lg z-20 py-1 text-xs max-h-72 overflow-y-auto">
                       {walletBankFileSnapshots.map((s, i) => (
                         <button key={i} onClick={() => {
+                          setWalletBankFileCount(s.fileCount ?? 1);
                           setWalletBankHeaders(s.headers); setWalletBankRows(s.rows);
                           setWalletBankMap({ date:autoDetect(s.headers,HINTS.date), desc:autoDetect(s.headers,HINTS.desc), debit:autoDetect(s.headers,HINTS.debit), credit:autoDetect(s.headers,HINTS.credit), ref:autoDetect(s.headers,HINTS.ref) });
                           setWalletBankFileSessionId(id => id + 1);
@@ -4486,7 +4781,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                 </button>
               )}
             </div>
-            <DropZone file={walletCashFile} onFile={loadWalletCash} onClear={() => { setWalletCashFile(null); setWalletCashHeaders([]); setWalletCashRows([]); setResults(null); }} headers={walletCashHeaders} rows={walletCashRows} />
+            <DropZone file={walletCashFile} fileCount={walletCashFileCount} onFiles={loadWalletCash} onClear={() => { setWalletCashFile(null); setWalletCashFileCount(0); setWalletCashHeaders([]); setWalletCashRows([]); setResults(null); }} headers={walletCashHeaders} rows={walletCashRows} />
             {walletCashHeaders.length > 0 && <div className="grid grid-cols-2 gap-2">
               <Sel label="التاريخ" headers={walletCashHeaders} value={walletCashMap.date} onChange={v => setWalletCashMap(m => ({ ...m, date:v }))} />
               <Sel label="البيان" headers={walletCashHeaders} value={walletCashMap.name} onChange={v => setWalletCashMap(m => ({ ...m, name:v }))} />
@@ -4512,6 +4807,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                     <div className="absolute left-0 mt-1 w-72 bg-card border border-border rounded-lg shadow-lg z-20 py-1 text-xs max-h-72 overflow-y-auto">
                       {walletCashFileSnapshots.map((s, i) => (
                         <button key={i} onClick={() => {
+                          setWalletCashFileCount(s.fileCount ?? 1);
                           setWalletCashHeaders(s.headers); setWalletCashRows(s.rows);
                           setWalletCashMap({ date:autoDetect(s.headers,HINTS.date), name:autoDetect(s.headers,HINTS.name), debit:autoDetect(s.headers,HINTS.debit), credit:autoDetect(s.headers,HINTS.credit), ref:autoDetect(s.headers,HINTS.ref) });
                           setWalletCashFileSessionId(id => id + 1);
@@ -4540,7 +4836,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                 </button>
               )}
             </div>
-            <DropZone file={jawwalBankFile} onFile={loadJawwalBank} onClear={() => { setJawwalBankFile(null); setJawwalBankHeaders([]); setJawwalBankRows([]); setResults(null); }} headers={jawwalBankHeaders} rows={jawwalBankRows} />
+            <DropZone file={jawwalBankFile} fileCount={jawwalBankFileCount} onFiles={loadJawwalBank} onClear={() => { setJawwalBankFile(null); setJawwalBankFileCount(0); setJawwalBankHeaders([]); setJawwalBankRows([]); setResults(null); }} headers={cleanedJawwalBankDataset.headers} rows={cleanedJawwalBankDataset.rows} />
             {jawwalBankHeaders.length > 0 && <div className="grid grid-cols-2 gap-2">
               <Sel label="التاريخ" headers={jawwalBankHeaders} value={jawwalBankMap.date} onChange={v => setJawwalBankMap(m => ({ ...m, date:v }))} />
               <Sel label="الإيضاحات / البيان" headers={jawwalBankHeaders} value={jawwalBankMap.desc} onChange={v => setJawwalBankMap(m => ({ ...m, desc:v }))} />
@@ -4567,6 +4863,11 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                 عكس المدين والدائن (إذا جاءت الأنواع مقلوبة)
               </label>
             )}
+            {jawwalBankHeaders.length > 0 && jawwalCashHeaders.length > 0 && (
+              <p className="rounded-lg border border-cyan-200 bg-cyan-50 px-3 py-2 text-xs leading-5 text-cyan-900">
+                تتم مطابقة ملفي جوال بي عند تطابق رقم الجوال والمبلغ معاً؛ ولا يُستخدم الاسم في المطابقة. الحركات التي لا يتحقق فيها الشرطان تبقى للمراجعة.
+              </p>
+            )}
             {jawwalBankFileSnapshots.length > 0 && (
               <div className="relative">
                 <button onClick={() => setShowJawwalBankSnapshots(v => !v)}
@@ -4579,14 +4880,16 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                     <div className="absolute left-0 mt-1 w-72 bg-card border border-border rounded-lg shadow-lg z-20 py-1 text-xs max-h-72 overflow-y-auto">
                       {jawwalBankFileSnapshots.map((s, i) => (
                         <button key={i} onClick={() => {
+                          setJawwalBankFileCount(s.fileCount ?? 1);
                           setJawwalBankHeaders(s.headers); setJawwalBankRows(s.rows);
+                          setJawwalBankSwap(false);
                           const totalAmount = autoDetect(s.headers, HINTS.totalAmount);
                           const direction = autoDetect(s.headers, HINTS.direction);
                           const debit = autoDetect(s.headers, HINTS.debit);
                           const credit = autoDetect(s.headers, HINTS.credit);
                           setJawwalBankMap({
                             date: autoDetect(s.headers, HINTS.date),
-                            desc: autoDetect(s.headers, HINTS.desc),
+                            desc: autoDetect(s.headers, ["بيان القيد", ...HINTS.desc]),
                             debit: debit === direction ? "" : debit,
                             credit: credit === direction ? "" : credit,
                             ref: autoDetect(s.headers, HINTS.ref),
@@ -4620,7 +4923,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                 </button>
               )}
             </div>
-            <DropZone file={jawwalCashFile} onFile={loadJawwalCash} onClear={() => { setJawwalCashFile(null); setJawwalCashHeaders([]); setJawwalCashRows([]); setResults(null); }} headers={jawwalCashHeaders} rows={jawwalCashRows} />
+            <DropZone file={jawwalCashFile} fileCount={jawwalCashFileCount} onFiles={loadJawwalCash} onClear={() => { setJawwalCashFile(null); setJawwalCashFileCount(0); setJawwalCashHeaders([]); setJawwalCashRows([]); setResults(null); }} headers={jawwalCashHeaders} rows={jawwalCashRows} />
             {jawwalCashHeaders.length > 0 && <div className="grid grid-cols-2 gap-2">
               <Sel label="التاريخ" headers={jawwalCashHeaders} value={jawwalCashMap.date} onChange={v => setJawwalCashMap(m => ({ ...m, date:v }))} />
               <Sel label="البيان" headers={jawwalCashHeaders} value={jawwalCashMap.name} onChange={v => setJawwalCashMap(m => ({ ...m, name:v }))} />
@@ -4646,6 +4949,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                     <div className="absolute left-0 mt-1 w-72 bg-card border border-border rounded-lg shadow-lg z-20 py-1 text-xs max-h-72 overflow-y-auto">
                       {jawwalCashFileSnapshots.map((s, i) => (
                         <button key={i} onClick={() => {
+                          setJawwalCashFileCount(s.fileCount ?? 1);
                           setJawwalCashHeaders(s.headers); setJawwalCashRows(s.rows);
                           setJawwalCashMap({ date:autoDetect(s.headers,HINTS.date), name:autoDetect(s.headers,HINTS.name), debit:autoDetect(s.headers,HINTS.debit), credit:autoDetect(s.headers,HINTS.credit), ref:autoDetect(s.headers,HINTS.ref) });
                           setJawwalCashFileSessionId(id => id + 1);
@@ -4698,7 +5002,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                   <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-dashed bg-slate-50 px-3 py-3 text-xs hover:bg-slate-100">
                     <Upload className="h-4 w-4 text-blue-600" />
                     <span className="flex-1 truncate">{source?.fileName ?? "اختر ملفاً"}</span>
-                    <input type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void loadCustomSource(platform.id, slot, file); event.currentTarget.value = ""; }} />
+                    <input type="file" multiple accept=".xlsx,.xls,.csv" className="hidden" onChange={(event) => { const files = Array.from(event.target.files ?? []); if (files.length) void loadCustomSource(platform.id, slot, files); event.currentTarget.value = ""; }} />
                   </label>
                   {source && <>
                     {source.rows.length > 0 && <button type="button" onClick={() => downloadCleanedSheet(source.fileName, source.headers, source.rows)} className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-2 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100"><Download className="h-3.5 w-3.5"/>تنزيل Excel منظف</button>}
@@ -4939,6 +5243,11 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                         <input type="checkbox" checked={allPendingSelected} onChange={togglePendingSelectAll} className="rounded"/>
                         تحديد الكل
                       </label>
+                      <button type="button" onClick={toggleCurrentPagePendingSelection} disabled={!currentPagePendingKeys.length}
+                        aria-pressed={allCurrentPagePendingSelected}
+                        className="rounded-md border border-blue-200 bg-white px-2.5 py-1 text-xs font-medium text-blue-800 hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-40">
+                        {allCurrentPagePendingSelected ? `إلغاء تحديد الـ ${currentPagePendingKeys.length} في الصفحة` : `تحديد الـ ${currentPagePendingKeys.length} في الصفحة`}
+                      </button>
                       <span className="text-xs text-muted-foreground">{selectedPendingKeys.size} محدد من {pendingRows.length}</span>
                       <div className="mr-auto flex items-center gap-2 flex-wrap">
                         <button onClick={handleMoveSelectedPendingToManual} disabled={!selectedPendingKeys.size}
@@ -4978,7 +5287,8 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                         const isSelected = selectedPendingKeys.has(key);
                         const isDropTarget = dropTargetKey === key;
                         const typeColor = r.cashier.type === "مدفوع" ? "text-red-600" : "text-green-600";
-                        const matchTypeLabel = r.matchType === "firstSecond" ? "👤 الأول+الثاني" :
+                        const matchTypeLabel = r.matchType === "phone" ? "مطابقة برقم الجوال" :
+                                              r.matchType === "firstSecond" ? "👤 الأول+الثاني" :
                                               r.matchType === "fourthName" ? "👤 الرابع" :
                                               r.matchType === "exact" ? "تطابق تام" :
                                               r.matchType === "bundle" ? "تجميع" :

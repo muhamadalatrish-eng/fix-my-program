@@ -140,7 +140,7 @@ export function AccountStatementProcessor() {
 
         {!!documents.length && <>
           <section className="space-y-3">
-            <div><h2 className="text-lg font-bold">اختر ما تريد الاحتفاظ به من كل ملف</h2><p className="mt-1 text-xs text-slate-500">عمود الرصيد غير محدد تلقائياً. يمكنك تعديله، وتحديد الحركات المستبعدة يدوياً.</p></div>
+            <div><h2 className="text-lg font-bold">اختر ما تريد الاحتفاظ به من كل ملف</h2><p className="mt-1 text-xs text-slate-500">يُتعرّف على صفحات كشف الأستاذ المتتابعة، وتُستبعد أسطر الرصيد السابق والمجموع. عمود الرصيد الجاري غير محدد تلقائياً؛ المدين والدائن هما مبالغ الحركات.</p></div>
             {downloaded && <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3">
               <span className="text-sm font-medium text-emerald-900">تم تنزيل الملف. يمكنك حذف الكشوفات الحالية والبدء من جديد.</span>
               <button type="button" onClick={() => { setDocuments([]); setExpanded(null); setDownloaded(false) }} className="inline-flex items-center gap-2 rounded-lg bg-rose-700 px-3 py-2 text-xs font-semibold text-white hover:bg-rose-800">
