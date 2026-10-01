@@ -7,6 +7,7 @@ import { AppSidebar, type ViewId } from "./app-sidebar"
 import { ProfileView } from "./profile-view"
 import { SettingsView } from "./settings-view"
 import App from "./reconciliation-app"
+import { AccountStatementProcessor } from "./account-statement-processor"
 
 export function AppShell() {
   const [ready, setReady] = useState(false)
@@ -101,6 +102,7 @@ export function AppShell() {
         {view === "assistant" && <App key="assistant" initialPage="assist" />}
         {view === "manual" && <App key="manual" initialPage="manual" />}
         {view === "report" && <App key="report" initialPage="report" />}
+        {view === "processor" && <AccountStatementProcessor />}
         {view === "profile" && <ProfileView username={username} onUsernameChange={setUsername} />}
         {view === "settings" && <SettingsView />}
       </div>

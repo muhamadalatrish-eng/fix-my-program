@@ -3,7 +3,7 @@
 import React, { useState, useCallback, useMemo, useEffect, useRef, useDeferredValue } from "react";
 import * as XLSX from "xlsx";
 import Reconciliation2, { type StageAResult } from "./Reconciliation2";
-import { Upload, FileSpreadsheet, Download, ChevronDown, X, Trash2, TriangleAlert as AlertTriangle, Check, Search, Link2, Link2Off, ChevronLeft, ChevronRight, CreditCard, Sparkles, Info, Save, Shield, FolderOpen, FolderPlus, RotateCcw, FolderMinus, GripVertical, Landmark, Users, BarChart3, ArrowUpRight } from "lucide-react";
+import { Upload, FileSpreadsheet, Download, ChevronDown, X, Trash2, TriangleAlert as AlertTriangle, Check, Search, Link2, Link2Off, ChevronLeft, ChevronRight, CreditCard, Sparkles, Info, Save, Shield, FolderOpen, FolderPlus, RotateCcw, FolderMinus, GripVertical, Landmark, Users, BarChart3, ArrowUpRight, Plus } from "lucide-react";
 
 // ─── Excel helpers ────────────────────────────────────────────────────────────
 function readFileBuf(f: File): Promise<ArrayBuffer> {
@@ -215,6 +215,22 @@ interface CashierRow {
   ref: string;
   date: string; orig: Record<string,unknown>;
   _fromHeld?: boolean;
+}
+type PlatformRole = "invoice" | "transfer" | "other";
+interface PlatformSource {
+  fileName: string;
+  headers: string[];
+  rows: Record<string, unknown>[];
+  map: { date: string; description: string; debit: string; credit: string; ref: string };
+  role: PlatformRole;
+  otherName: string;
+  otherRole: "invoice" | "transfer";
+}
+interface CustomPlatform {
+  id: number;
+  name: string;
+  transfer: PlatformSource | null;
+  invoice: PlatformSource | null;
 }
 interface ManualMatchGroup {
   id: string;
@@ -1410,6 +1426,8 @@ interface SavedProject {
   heldItems: HeldItem[];
   returnedHeldBank?: BankRow[];
   returnedHeldCashier?: CashierRow[];
+  platformNames?: { bank: string; wallet: string; jawwal: string };
+  customPlatforms?: CustomPlatform[];
 }
 
 async function loadProjectsList(): Promise<SavedProject[]> {
@@ -2001,6 +2019,9 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   const [jawwalCashRows, setJawwalCashRows] = useState<Record<string,unknown>[]>([]);
   const [jawwalCashMap, setJawwalCashMap] = useState({ date:"", name:"", debit:"", credit:"", ref:"" });
   const [jawwalCashSwap, setJawwalCashSwap] = useState(false);
+  const [platformNames, setPlatformNames] = useState({ bank: "بنك فلسطين", wallet: "بال بي", jawwal: "جوال بي" });
+  const [customPlatforms, setCustomPlatforms] = useState<CustomPlatform[]>([]);
+  const nextCustomPlatformId = useRef(0);
 
   // ─── File snapshots for restore functionality ──────────────────────────────
   interface FileSnapshot {
@@ -2095,6 +2116,9 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         setJawwalCashRows(session.jawwalCashRows || []);
         setJawwalCashMap({ date:"", name:"", debit:"", credit:"", ref:"", ...(session.jawwalCashMap || {}) });
         setJawwalCashSwap(!!session.jawwalCashSwap);
+        setPlatformNames({ bank: "بنك فلسطين", wallet: "بال بي", jawwal: "جوال بي", ...(session.platformNames || {}) });
+        setCustomPlatforms(session.customPlatforms || []);
+        nextCustomPlatformId.current = Math.max(0, ...(session.customPlatforms || []).map((platform: CustomPlatform) => platform.id + 1));
         setBankFileSnapshots(session.bankFileSnapshots || []);
         setCashFileSnapshots(session.cashFileSnapshots || []);
         setWalletBankFileSnapshots(session.walletBankFileSnapshots || []);
@@ -2128,6 +2152,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         walletCashHeaders, walletCashRows, walletCashMap, walletCashSwap,
         jawwalBankHeaders, jawwalBankRows, jawwalBankMap, jawwalBankSwap,
         jawwalCashHeaders, jawwalCashRows, jawwalCashMap, jawwalCashSwap,
+        platformNames, customPlatforms,
         bankFileSnapshots, cashFileSnapshots, walletBankFileSnapshots, walletCashFileSnapshots,
         jawwalBankFileSnapshots, jawwalCashFileSnapshots,
         manualGroups, savedMatches, nameAliases,
@@ -2144,6 +2169,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     walletCashHeaders, walletCashRows, walletCashMap, walletCashSwap,
     jawwalBankHeaders, jawwalBankRows, jawwalBankMap, jawwalBankSwap,
     jawwalCashHeaders, jawwalCashRows, jawwalCashMap, jawwalCashSwap,
+    platformNames, customPlatforms,
     bankFileSnapshots, cashFileSnapshots, walletBankFileSnapshots, walletCashFileSnapshots,
     jawwalBankFileSnapshots, jawwalCashFileSnapshots,
     manualGroups, savedMatches, nameAliases, rejectedPairs,
@@ -2208,6 +2234,31 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       setJawwalCashFileSnapshots(prev => [{ label: f.name, headers, rows, savedAt: new Date().toLocaleString("ar-SA") }, ...prev].slice(0, 5));
     } catch (e) { setError((e as Error).message); }
   };
+  const loadCustomSource = async (platformId: number, slot: "transfer" | "invoice", file: File) => {
+    setError(null);
+    setResults(null);
+    try {
+      const { headers, rows } = parseSheet(await readFileBuf(file));
+      const source: PlatformSource = {
+        fileName: file.name,
+        headers,
+        rows,
+        map: {
+          date: autoDetect(headers, HINTS.date),
+          description: autoDetect(headers, slot === "invoice" ? HINTS.name : HINTS.desc) || autoDetect(headers, HINTS.name),
+          debit: autoDetect(headers, HINTS.debit),
+          credit: autoDetect(headers, HINTS.credit),
+          ref: autoDetect(headers, HINTS.ref),
+        },
+        role: slot,
+        otherName: "",
+        otherRole: slot,
+      };
+      setCustomPlatforms((current) => current.map((platform) => platform.id === platformId ? { ...platform, [slot]: source } : platform));
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
 
   const parsedBank = useMemo(():BankRow[]=>{
     return bankRowsRaw.map((r,i)=>{
@@ -2217,18 +2268,18 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         id:i, date:fmtDate(bankMap.date?r[bankMap.date]:""),
         description:String(bankMap.desc?r[bankMap.desc]:"").trim(),
         debit, credit, rawAmount, type,
-        accountType: "بنك فلسطين",
+        accountType: platformNames.bank,
         ref: String((bankMap as any).ref ? r[(bankMap as any).ref] : "").trim(),
         orig:r
       };
     }).filter((r): r is BankRow => r !== null);
-  },[bankRowsRaw,bankMap,bankSwap]);
+  },[bankRowsRaw,bankMap,bankSwap,platformNames.bank]);
 
   const parseWalletBankRows = useMemo(():BankRow[] => walletBankRows.map((r,i) => {
     const { debit, credit, rawAmount, type } = resolveDebitCredit(r, walletBankMap.debit, walletBankMap.credit, walletBankSwap);
     if (!rawAmount) return null;
-    return { id: 1000000 + i, date:fmtDate(walletBankMap.date ? r[walletBankMap.date] : ""), description:String(walletBankMap.desc ? r[walletBankMap.desc] : "").trim(), debit, credit, rawAmount, type, accountType:"بال بي", ref:String(walletBankMap.ref ? r[walletBankMap.ref] : "").trim(), orig:r };
-  }).filter((r): r is BankRow => r !== null), [walletBankRows, walletBankMap, walletBankSwap]);
+    return { id: 1000000 + i, date:fmtDate(walletBankMap.date ? r[walletBankMap.date] : ""), description:String(walletBankMap.desc ? r[walletBankMap.desc] : "").trim(), debit, credit, rawAmount, type, accountType:platformNames.wallet, ref:String(walletBankMap.ref ? r[walletBankMap.ref] : "").trim(), orig:r };
+  }).filter((r): r is BankRow => r !== null), [walletBankRows, walletBankMap, walletBankSwap, platformNames.wallet]);
 
   const parsedCashier = useMemo(():CashierRow[]=>{
     const rows = cashRowsRaw.map((r,i)=>{
@@ -2241,14 +2292,14 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       return {
         id:i, rawName, name, notes, splitExpr, debit, credit, amount,
         matchAmount: ma ?? amount, type,
-        accountType: "بنك فلسطين",
+        accountType: platformNames.bank,
         ref: String((cashMap as any).ref ? r[(cashMap as any).ref] : "").trim(),
         date:fmtDate(cashMap.date?r[cashMap.date]:""), orig:r
       };
     }).filter((r): r is CashierRow => r !== null);
 
     return rows;
-  },[cashRowsRaw,cashMap,cashSwap]);
+  },[cashRowsRaw,cashMap,cashSwap,platformNames.bank]);
 
   const parsedWalletCashier = useMemo(():CashierRow[] => walletCashRows.map((r,i) => {
     const rawName = String(walletCashMap.name ? r[walletCashMap.name] : "").trim();
@@ -2257,14 +2308,14 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     const { debit, credit, rawAmount, type } = resolveDebitCredit(r, walletCashMap.debit, walletCashMap.credit, walletCashSwap);
     const amount = rawAmount || ma || 0;
     if (!amount) return null;
-    return { id: 2000000 + i, rawName, name, notes, splitExpr, debit, credit, amount, matchAmount:ma ?? amount, type, accountType:"بال بي", ref:String(walletCashMap.ref ? r[walletCashMap.ref] : "").trim(), date:fmtDate(walletCashMap.date ? r[walletCashMap.date] : ""), orig:r };
-  }).filter((r): r is CashierRow => r !== null), [walletCashRows, walletCashMap, walletCashSwap]);
+    return { id: 2000000 + i, rawName, name, notes, splitExpr, debit, credit, amount, matchAmount:ma ?? amount, type, accountType:platformNames.wallet, ref:String(walletCashMap.ref ? r[walletCashMap.ref] : "").trim(), date:fmtDate(walletCashMap.date ? r[walletCashMap.date] : ""), orig:r };
+  }).filter((r): r is CashierRow => r !== null), [walletCashRows, walletCashMap, walletCashSwap, platformNames.wallet]);
 
   const parseJawwalBankRows = useMemo(():BankRow[] => jawwalBankRows.map((r,i) => {
     const { debit, credit, rawAmount, type } = resolveDebitCredit(r, jawwalBankMap.debit, jawwalBankMap.credit, jawwalBankSwap);
     if (!rawAmount) return null;
-    return { id: 4000000 + i, date:fmtDate(jawwalBankMap.date ? r[jawwalBankMap.date] : ""), description:String(jawwalBankMap.desc ? r[jawwalBankMap.desc] : "").trim(), debit, credit, rawAmount, type, accountType:"جوال بي", ref:String(jawwalBankMap.ref ? r[jawwalBankMap.ref] : "").trim(), orig:r };
-  }).filter((r): r is BankRow => r !== null), [jawwalBankRows, jawwalBankMap, jawwalBankSwap]);
+    return { id: 4000000 + i, date:fmtDate(jawwalBankMap.date ? r[jawwalBankMap.date] : ""), description:String(jawwalBankMap.desc ? r[jawwalBankMap.desc] : "").trim(), debit, credit, rawAmount, type, accountType:platformNames.jawwal, ref:String(jawwalBankMap.ref ? r[jawwalBankMap.ref] : "").trim(), orig:r };
+  }).filter((r): r is BankRow => r !== null), [jawwalBankRows, jawwalBankMap, jawwalBankSwap, platformNames.jawwal]);
 
   const parsedJawwalCashier = useMemo(():CashierRow[] => jawwalCashRows.map((r,i) => {
     const rawName = String(jawwalCashMap.name ? r[jawwalCashMap.name] : "").trim();
@@ -2273,24 +2324,81 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     const { debit, credit, rawAmount, type } = resolveDebitCredit(r, jawwalCashMap.debit, jawwalCashMap.credit, jawwalCashSwap);
     const amount = rawAmount || ma || 0;
     if (!amount) return null;
-    return { id: 5000000 + i, rawName, name, notes, splitExpr, debit, credit, amount, matchAmount:ma ?? amount, type, accountType:"جوال بي", ref:String(jawwalCashMap.ref ? r[jawwalCashMap.ref] : "").trim(), date:fmtDate(jawwalCashMap.date ? r[jawwalCashMap.date] : ""), orig:r };
-  }).filter((r): r is CashierRow => r !== null), [jawwalCashRows, jawwalCashMap, jawwalCashSwap]);
+    return { id: 5000000 + i, rawName, name, notes, splitExpr, debit, credit, amount, matchAmount:ma ?? amount, type, accountType:platformNames.jawwal, ref:String(jawwalCashMap.ref ? r[jawwalCashMap.ref] : "").trim(), date:fmtDate(jawwalCashMap.date ? r[jawwalCashMap.date] : ""), orig:r };
+  }).filter((r): r is CashierRow => r !== null), [jawwalCashRows, jawwalCashMap, jawwalCashSwap, platformNames.jawwal]);
+
+  const parsedCustomRows = useMemo(() => {
+    const bank: BankRow[] = [];
+    const cashier: CashierRow[] = [];
+    for (const platform of customPlatforms) {
+      for (const slot of ["transfer", "invoice"] as const) {
+        const source = platform[slot];
+        if (!source) continue;
+        const role = source.role === "other" ? source.otherRole : source.role;
+        source.rows.forEach((row, index) => {
+          const { debit, credit, rawAmount, type } = resolveDebitCredit(row, source.map.debit, source.map.credit, false);
+          const date = fmtDate(source.map.date ? row[source.map.date] : "");
+          const ref = String(source.map.ref ? row[source.map.ref] : "").trim();
+          const description = String(source.map.description ? row[source.map.description] : "").trim();
+          const baseId = platform.id * 100000 + index;
+          if (role === "transfer") {
+            if (!rawAmount) return;
+            bank.push({
+              id: 10000000 + baseId,
+              date,
+              description,
+              debit,
+              credit,
+              rawAmount,
+              type,
+              accountType: platform.name.trim() || `منصة مخصصة ${platform.id + 1}`,
+              ref,
+              orig: row,
+            });
+            return;
+          }
+          const rawName = description;
+          const { name, notes } = parseCashierName(rawName);
+          const { splitExpr, matchAmount: notedAmount } = parseNotes(notes);
+          const amount = rawAmount || notedAmount || 0;
+          if (amount === 0 && !notedAmount) return;
+          cashier.push({
+            id: 20000000 + baseId,
+            rawName,
+            name,
+            notes,
+            splitExpr,
+            debit,
+            credit,
+            amount,
+            matchAmount: notedAmount ?? amount,
+            type,
+            accountType: platform.name.trim() || `منصة مخصصة ${platform.id + 1}`,
+            ref,
+            date,
+            orig: row,
+          });
+        });
+      }
+    }
+    return { bank, cashier };
+  }, [customPlatforms]);
 
   const heldBankKeys = useMemo(() => new Set(heldItems.filter(h=>h.kind==="bank").map(h => `${h.fileSessionId}:${h.refId}`)), [heldItems]);
   const heldCashierKeys = useMemo(() => new Set(heldItems.filter(h=>h.kind==="cashier").map(h => `${h.fileSessionId}:${h.refId}`)), [heldItems]);
 
   const activeBank = useMemo(
-    () => [...parsedBank.filter(b => !heldBankKeys.has(`${bankFileSessionId}:${b.id}`)), ...parseWalletBankRows, ...parseJawwalBankRows, ...returnedHeldBank],
-    [parsedBank, parseWalletBankRows, parseJawwalBankRows, heldBankKeys, bankFileSessionId, returnedHeldBank]
+    () => [...parsedBank.filter(b => !heldBankKeys.has(`${bankFileSessionId}:${b.id}`)), ...parseWalletBankRows, ...parseJawwalBankRows, ...parsedCustomRows.bank, ...returnedHeldBank],
+    [parsedBank, parseWalletBankRows, parseJawwalBankRows, parsedCustomRows, heldBankKeys, bankFileSessionId, returnedHeldBank]
   );
   const activeCashier = useMemo(
     () => [...stageAInvoices.map((invoice, index) => ({
       id: 3000000 + index, rawName: invoice.originalName, name: invoice.name, notes: invoice.issue, splitExpr: "",
       debit: invoice.amount, credit: 0, amount: invoice.amount, matchAmount: invoice.amount,
-      type: "مدفوع" as const, accountType: invoice.source === "بال بي" ? "بال بي" : "بنك فلسطين",
+      type: "مدفوع" as const, accountType: invoice.source === "بال بي" ? platformNames.wallet : platformNames.bank,
       ref: invoice.invoiceNumber, date: invoice.registrationTime, orig: invoice.invoice
-    })), ...parsedCashier.filter(c => !heldCashierKeys.has(`${cashFileSessionId}:${c.id}`)), ...parsedWalletCashier, ...parsedJawwalCashier, ...returnedHeldCashier],
-    [stageAInvoices, parsedCashier, parsedWalletCashier, parsedJawwalCashier, heldCashierKeys, cashFileSessionId, returnedHeldCashier]
+    })), ...parsedCashier.filter(c => !heldCashierKeys.has(`${cashFileSessionId}:${c.id}`)), ...parsedWalletCashier, ...parsedJawwalCashier, ...parsedCustomRows.cashier, ...returnedHeldCashier],
+    [stageAInvoices, parsedCashier, parsedWalletCashier, parsedJawwalCashier, parsedCustomRows, heldCashierKeys, cashFileSessionId, returnedHeldCashier, platformNames]
   );
 
   const savedKeys = useMemo(() => new Set(savedMatches.map(s => `${s.cashierId}-${s.bankId}`)), [savedMatches]);
@@ -2923,7 +3031,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       cashHeaders, cashRowsRaw, cashMap, cashSwap, cashFileSessionId,
       manualGroups, savedMatches,
       rejectedPairs: Array.from(rejectedPairs),
-      visaItems, heldItems, returnedHeldBank, returnedHeldCashier
+      visaItems, heldItems, returnedHeldBank, returnedHeldCashier, platformNames, customPlatforms
     };
     await persistProjectsList([...projects, project]);
     setToast(`تم حفظ المشروع "${name}" ✓`);
@@ -2940,6 +3048,9 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     setHeldItems(p.heldItems ?? []);
     setReturnedHeldBank((p as any).returnedHeldBank ?? []);
     setReturnedHeldCashier((p as any).returnedHeldCashier ?? []);
+    setPlatformNames({ bank: "بنك فلسطين", wallet: "بال بي", jawwal: "جوال بي", ...(p.platformNames ?? {}) });
+    setCustomPlatforms(p.customPlatforms ?? []);
+    nextCustomPlatformId.current = Math.max(0, ...(p.customPlatforms ?? []).map(platform => platform.id + 1));
     setBankFile(null); setCashFile(null);
     setResults(null);
   };
@@ -2968,6 +3079,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     setWalletCashFile(null); setWalletCashHeaders([]); setWalletCashRows([]); setWalletCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setWalletCashSwap(false);
     setJawwalBankFile(null); setJawwalBankHeaders([]); setJawwalBankRows([]); setJawwalBankMap({date:"",desc:"",debit:"",credit:"",ref:""}); setJawwalBankSwap(false);
     setJawwalCashFile(null); setJawwalCashHeaders([]); setJawwalCashRows([]); setJawwalCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setJawwalCashSwap(false);
+    setPlatformNames({ bank: "بنك فلسطين", wallet: "بال بي", jawwal: "جوال بي" }); setCustomPlatforms([]); nextCustomPlatformId.current = 0;
     setBankFileSnapshots([]); setCashFileSnapshots([]);
     setWalletBankFileSnapshots([]); setWalletCashFileSnapshots([]);
     setJawwalBankFileSnapshots([]); setJawwalCashFileSnapshots([]);
@@ -3280,10 +3392,25 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
           </div>
         </div>}
 
+        <section className="rounded-xl border border-slate-200 bg-white p-4">
+          <h2 className="text-sm font-semibold">أسماء المنصات</h2>
+          <p className="mt-1 text-xs text-muted-foreground">الاسم نفسه يربط فواتير المنصة بحوالاتها عند المطابقة.</p>
+          <div className="mt-3 grid gap-3 sm:grid-cols-3">
+            {([
+              ["bank", "المنصة الرئيسية (بنك فلسطين سابقاً)"],
+              ["wallet", "كشف بال بي"],
+              ["jawwal", "كشف جوال بي"],
+            ] as const).map(([key, label]) => <label key={key} className="text-xs font-medium">
+              {label}
+              <input value={platformNames[key]} onChange={(event) => setPlatformNames((current) => ({ ...current, [key]: event.target.value }))} className="mt-1 w-full rounded-lg border bg-slate-50 px-3 py-2 text-sm" />
+            </label>)}
+          </div>
+        </section>
+
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
           <div className="bg-card border p-4 rounded-xl space-y-4">
             <div className="flex items-center justify-between">
-               <h2 className="font-semibold text-sm">كشف حوالات بنك فلسطين</h2>
+               <h2 className="font-semibold text-sm">كشف حوالات {platformNames.bank}</h2>
               {(bankHeaders.length > 0 || bankFileSnapshots.length > 0) && (
                 <button onClick={() => handleClearPlatform("bank")} title="مسح بيانات هذه المنصة فقط"
                   className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-red-600 transition-colors">
@@ -3340,7 +3467,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
           </div>
           {!stageAInvoices.length && <div className="bg-card border p-4 rounded-xl space-y-4">
             <div className="flex items-center justify-between">
-               <h2 className="font-semibold text-sm">كشف فواتير بنك فلسطين</h2>
+               <h2 className="font-semibold text-sm">كشف فواتير {platformNames.bank}</h2>
               {(cashHeaders.length > 0 || cashFileSnapshots.length > 0) && (
                 <button onClick={() => handleClearPlatform("cash")} title="مسح بيانات هذه المنصة فقط"
                   className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-red-600 transition-colors">
@@ -3397,7 +3524,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
           </div>}
           <div className="bg-card border p-4 rounded-xl space-y-4">
             <div className="flex items-center justify-between">
-               <h2 className="font-semibold text-sm">كشف حوالات بال بي</h2>
+               <h2 className="font-semibold text-sm">كشف حوالات {platformNames.wallet}</h2>
               {(walletBankHeaders.length > 0 || walletBankFileSnapshots.length > 0) && (
                 <button onClick={() => handleClearPlatform("walletBank")} title="مسح بيانات هذه المنصة فقط"
                   className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-red-600 transition-colors">
@@ -3450,7 +3577,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
           </div>
           {!stageAInvoices.length && <div className="bg-card border p-4 rounded-xl space-y-4">
             <div className="flex items-center justify-between">
-               <h2 className="font-semibold text-sm">كشف فواتير بال بي</h2>
+               <h2 className="font-semibold text-sm">كشف فواتير {platformNames.wallet}</h2>
               {(walletCashHeaders.length > 0 || walletCashFileSnapshots.length > 0) && (
                 <button onClick={() => handleClearPlatform("walletCash")} title="مسح بيانات هذه المنصة فقط"
                   className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-red-600 transition-colors">
@@ -3503,7 +3630,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
           </div>}
           {!stageAInvoices.length && <div className="bg-card border p-4 rounded-xl space-y-4">
             <div className="flex items-center justify-between">
-               <h2 className="font-semibold text-sm">كشف حوالات جوال بي</h2>
+               <h2 className="font-semibold text-sm">كشف حوالات {platformNames.jawwal}</h2>
               {(jawwalBankHeaders.length > 0 || jawwalBankFileSnapshots.length > 0) && (
                 <button onClick={() => handleClearPlatform("jawwalBank")} title="مسح بيانات هذه المنصة فقط"
                   className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-red-600 transition-colors">
@@ -3556,7 +3683,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
           </div>}
           {!stageAInvoices.length && <div className="bg-card border p-4 rounded-xl space-y-4">
             <div className="flex items-center justify-between">
-               <h2 className="font-semibold text-sm">كشف فواتير جوال بي</h2>
+               <h2 className="font-semibold text-sm">كشف فواتير {platformNames.jawwal}</h2>
               {(jawwalCashHeaders.length > 0 || jawwalCashFileSnapshots.length > 0) && (
                 <button onClick={() => handleClearPlatform("jawwalCash")} title="مسح بيانات هذه المنصة فقط"
                   className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-red-600 transition-colors">
@@ -3608,6 +3735,71 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
             )}
           </div>}
         </div>
+
+        <section className="space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold">منصات وملفات إضافية</h2>
+              <p className="mt-1 text-xs text-muted-foreground">أضف أي عدد من المنصات، وسمّ كل منصة واختر دور كل ملف في المطابقة.</p>
+            </div>
+            <button onClick={() => {
+              const id = nextCustomPlatformId.current++;
+              setCustomPlatforms((current) => [...current, { id, name: "", transfer: null, invoice: null }]);
+            }} className="inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700">
+              <Plus className="h-4 w-4" />إضافة منصة
+            </button>
+          </div>
+          {customPlatforms.map((platform) => <article key={platform.id} className="rounded-xl border border-blue-100 bg-white p-4 shadow-sm">
+            <div className="mb-4 flex flex-wrap items-end gap-3">
+              <label className="min-w-56 flex-1 text-xs font-semibold">اسم المنصة
+                <input value={platform.name} placeholder="مثال: بنك القدس" onChange={(event) => setCustomPlatforms((current) => current.map((item) => item.id === platform.id ? { ...item, name: event.target.value } : item))} className="mt-1 w-full rounded-lg border bg-slate-50 px-3 py-2 text-sm" />
+              </label>
+              <button type="button" onClick={() => setCustomPlatforms((current) => current.filter((item) => item.id !== platform.id))} className="inline-flex items-center gap-1 rounded-lg border border-red-200 px-3 py-2 text-xs text-red-700 hover:bg-red-50"><Trash2 className="h-3.5 w-3.5" />حذف المنصة</button>
+            </div>
+            <div className="grid gap-4 lg:grid-cols-2">
+              {(["transfer", "invoice"] as const).map((slot) => {
+                const source = platform[slot];
+                const updateSource = (updater: (value: PlatformSource) => PlatformSource) => setCustomPlatforms((current) => current.map((item) => {
+                  if (item.id !== platform.id || !item[slot]) return item;
+                  return { ...item, [slot]: updater(item[slot]!) };
+                }));
+                return <div key={slot} className="space-y-3 rounded-lg border border-slate-200 p-3">
+                  <h3 className="text-xs font-bold">{slot === "transfer" ? "ملف الحوالات" : "ملف الفواتير"}</h3>
+                  <label className="flex cursor-pointer items-center gap-2 rounded-lg border border-dashed bg-slate-50 px-3 py-3 text-xs hover:bg-slate-100">
+                    <Upload className="h-4 w-4 text-blue-600" />
+                    <span className="flex-1 truncate">{source?.fileName ?? "اختر ملفاً"}</span>
+                    <input type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void loadCustomSource(platform.id, slot, file); event.currentTarget.value = ""; }} />
+                  </label>
+                  {source && <>
+                    <label className="block text-xs font-medium">نوع الملف
+                      <select value={source.role} onChange={(event) => updateSource((value) => ({ ...value, role: event.target.value as PlatformRole }))} className="mt-1 w-full rounded-lg border bg-white px-3 py-2">
+                        <option value="invoice">فواتير</option><option value="transfer">حوالات</option><option value="other">شيء آخر</option>
+                      </select>
+                    </label>
+                    {source.role === "other" && <div className="grid gap-2 sm:grid-cols-2">
+                      <label className="text-xs font-medium">اسم النوع
+                        <input value={source.otherName} placeholder="مثال: سند قبض" onChange={(event) => updateSource((value) => ({ ...value, otherName: event.target.value }))} className="mt-1 w-full rounded-lg border bg-white px-3 py-2" />
+                      </label>
+                      <label className="text-xs font-medium">يعامل كـ
+                        <select value={source.otherRole} onChange={(event) => updateSource((value) => ({ ...value, otherRole: event.target.value as "invoice" | "transfer" }))} className="mt-1 w-full rounded-lg border bg-white px-3 py-2">
+                          <option value="invoice">فواتير</option><option value="transfer">حوالات</option>
+                        </select>
+                      </label>
+                    </div>}
+                    {source.headers.length > 0 && <div className="grid grid-cols-2 gap-2">
+                      <Sel label="التاريخ" headers={source.headers} value={source.map.date} onChange={(value) => updateSource((item) => ({ ...item, map: { ...item.map, date: value } }))} />
+                      <Sel label="البيان / الاسم" headers={source.headers} value={source.map.description} onChange={(value) => updateSource((item) => ({ ...item, map: { ...item.map, description: value } }))} />
+                      <Sel label="المدين / المبلغ المستلم" headers={source.headers} value={source.map.debit} onChange={(value) => updateSource((item) => ({ ...item, map: { ...item.map, debit: value } }))} />
+                      <Sel label="الدائن / المبلغ المدفوع" headers={source.headers} value={source.map.credit} onChange={(value) => updateSource((item) => ({ ...item, map: { ...item.map, credit: value } }))} />
+                      <Sel label="رقم المرجع" headers={source.headers} value={source.map.ref} onChange={(value) => updateSource((item) => ({ ...item, map: { ...item.map, ref: value } }))} />
+                    </div>}
+                    {source.role === "other" && !!source.otherName.trim() && <p className="text-[11px] text-slate-500">سيتم التعامل مع «{source.otherName}» كـ{source.otherRole === "invoice" ? "فواتير" : "حوالات"}.</p>}
+                  </>}
+                </div>
+              })}
+            </div>
+          </article>)}
+        </section>
 
         <div className="flex gap-3 flex-wrap">
           <button onClick={run} disabled={!canRun || loading}
