@@ -3,7 +3,9 @@
 import React, { useState, useCallback, useMemo, useEffect, useRef, useDeferredValue } from "react";
 import * as XLSX from "xlsx";
 import Reconciliation2, { type StageAResult } from "./Reconciliation2";
+import { BatchCutoffTool, ClearingTool, SplitTool, syntheticTransactionId, transactionKey, type BankSplit, type ClearingGroup, type CutoffBatch, type CutoffRowRef, type SplitAllocation, type ToolBankRow, type ToolCashierRow } from "./reconciliation-tools";
 import { Upload, FileSpreadsheet, Download, ChevronDown, X, Trash2, TriangleAlert as AlertTriangle, Check, Search, Link2, Link2Off, ChevronLeft, ChevronRight, CreditCard, Sparkles, Info, Save, Shield, FolderOpen, FolderPlus, RotateCcw, FolderMinus, GripVertical, Landmark, Users, BarChart3, ArrowUpRight, Plus } from "lucide-react";
+import { parseTabularRows, type StatementCell } from "../lib/account-statement-processor";
 
 // ─── Excel helpers ────────────────────────────────────────────────────────────
 function readFileBuf(f: File): Promise<ArrayBuffer> {
@@ -16,9 +18,22 @@ function readFileBuf(f: File): Promise<ArrayBuffer> {
 }
 function parseSheet(buf: ArrayBuffer) {
   const wb = XLSX.read(buf, { type: "array", cellDates: true });
-  const ws = wb.Sheets[wb.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws, { defval: "" });
-  return { headers: rows.length ? Object.keys(rows[0]) : [], rows };
+  for (const name of wb.SheetNames) {
+    const matrix = XLSX.utils.sheet_to_json<StatementCell[]>(wb.Sheets[name], { header: 1, defval: "", raw: false });
+    const parsed = parseTabularRows(matrix);
+    if (!parsed) continue;
+    const rows = parsed.rows.map((values) => Object.fromEntries(parsed.headers.map((header, index) => [header, values[index] ?? ""])));
+    return { headers: parsed.headers, rows };
+  }
+  throw new Error("لم أتمكن من العثور على صف عناوين وبيانات في الملف.");
+}
+function downloadCleanedSheet(fileName: string, headers: string[], rows: Record<string, unknown>[]) {
+  if (!headers.length || !rows.length) return;
+  const worksheet = XLSX.utils.aoa_to_sheet([headers, ...rows.map((row) => headers.map((header) => row[header] ?? ""))]);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, "الكشف المنظف");
+  const baseName = fileName.replace(/\.[^.]+$/, "") || "كشف";
+  XLSX.writeFile(workbook, `${baseName}-منظف.xlsx`);
 }
 function fmtDate(v: unknown): string {
   if (!v) return "";
@@ -197,7 +212,7 @@ function nameTokens(s: string): string[] {
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-interface BankRow {
+export interface BankRow {
   id: number; date: string; description: string;
   debit: number; credit: number; rawAmount: number;
   type: "مدفوع" | "مستلم";
@@ -205,8 +220,9 @@ interface BankRow {
   ref: string;
   orig: Record<string,unknown>;
   _fromHeld?: boolean;
+  _fileSessionId?: number;
 }
-interface CashierRow {
+export interface CashierRow {
   id: number; rawName: string; name: string; notes: string;
   splitExpr: string|null;
   debit: number; credit: number; amount: number; matchAmount: number;
@@ -215,6 +231,7 @@ interface CashierRow {
   ref: string;
   date: string; orig: Record<string,unknown>;
   _fromHeld?: boolean;
+  _fileSessionId?: number;
 }
 type PlatformRole = "invoice" | "transfer" | "other";
 interface PlatformSource {
@@ -225,12 +242,19 @@ interface PlatformSource {
   role: PlatformRole;
   otherName: string;
   otherRole: "invoice" | "transfer";
+  fileSessionId: number;
 }
 interface CustomPlatform {
   id: number;
   name: string;
   transfer: PlatformSource | null;
   invoice: PlatformSource | null;
+}
+interface FileSnapshot {
+  label: string;
+  headers: string[];
+  rows: Record<string, unknown>[];
+  savedAt: string;
 }
 interface ManualMatchGroup {
   id: string;
@@ -262,6 +286,21 @@ interface SavedMatch {
   editorNotes?: string;
 }
 
+function bankSplitAllocationGroups(split: BankSplit): Map<string, SplitAllocation[]> {
+  const groups = new Map<string, SplitAllocation[]>();
+  split.allocations.forEach(allocation => {
+    if (allocation.kind !== "company" || allocation.cashierId == null) return;
+    const key = `${allocation.cashierSessionId ?? 0}:${allocation.cashierId}`;
+    groups.set(key, [...(groups.get(key) ?? []), allocation]);
+  });
+  return groups;
+}
+
+function bankSplitVirtualId(split: BankSplit, cashierKey: string, allocations: SplitAllocation[]): number {
+  if (allocations.length === 1) return syntheticTransactionId(`${split.id}:${allocations[0].id}`);
+  return syntheticTransactionId(`${split.id}:cashier:${cashierKey}`);
+}
+
 // ─── Visa items ──────────────────────────────────────────────────────────────
 interface VisaItem {
   id: string;
@@ -287,10 +326,50 @@ interface HeldItem {
   note?: string;
 }
 
-let heldReturnSequence = 0;
-function nextHeldRowId(): number {
-  heldReturnSequence = (heldReturnSequence + 1) % 1000;
-  return -(Date.now() * 1000 + heldReturnSequence);
+function dedupeHeldItems(items: HeldItem[]): HeldItem[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const key = `${item.kind}:${item.fileSessionId}:${item.refId}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function getNonReconciliationBankReason(row: BankRow): string | null {
+  const description = row.description
+    .normalize("NFKC")
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, "")
+    .replace(/[أإآ]/g, "ا")
+    .toLowerCase();
+  if (/نقاط\s*بيع/.test(description) && /عمول|صرف/.test(description)) {
+    return "عمليات نقاط البيع والعمولات";
+  }
+  if (/مشتريات/.test(description) && /عمول/.test(description) && /تجار|بطاق/.test(description)) {
+    return "عمولات المشتريات والتجار";
+  }
+  if (/تحويل\s*(الكتروني|إلكتروني)?\s*موبايل/.test(description)) {
+    const parties = description.match(/من\s+(.+?)\s+الى\s+(.+?)(?:[,/؛]|$)/);
+    const normalizeParty = (party: string) => party
+      .replace(/حساب|رقم|بنكي|محفظة|تحويل|الكتروني|موبايل|\d+/g, "")
+      .replace(/[\s.,/-]/g, "");
+    if (parties?.[1] && normalizeParty(parties[1]) === normalizeParty(parties[2])) {
+      return "تحويل بين حسابات صاحب الحساب نفسه";
+    }
+  }
+  return null;
+}
+
+function sameBankMovement(a: BankRow, b: BankRow): boolean {
+  return a.date === b.date && a.description === b.description && a.type === b.type &&
+    a.debit === b.debit && a.credit === b.credit && a.rawAmount === b.rawAmount &&
+    a.accountType === b.accountType && a.ref === b.ref;
+}
+
+function sameCashierMovement(a: CashierRow, b: CashierRow): boolean {
+  return a.date === b.date && a.name === b.name && a.rawName === b.rawName &&
+    a.type === b.type && a.amount === b.amount && a.matchAmount === b.matchAmount &&
+    a.debit === b.debit && a.credit === b.credit && a.accountType === b.accountType;
 }
 
 function normAccountType(s: string): string {
@@ -586,7 +665,7 @@ type MatchResult =
   | { type:"unmatchedCashier"; cashier:CashierRow; reason:"اختلاف في الاسم"|"غير موجودة في البنك" }
   | { type:"unmatchedBank"; bank:BankRow; reason:"اختلاف في الاسم"|"الحوالة غير موجودة في الكاشير" };
 
-type TabId = "saved"|"pending"|"manual"|"visa"|"jawwalPay"|"mahmoudWallet"|"held"|"uCashier"|"uBank";
+type TabId = "saved"|"pending"|"manual"|"visa"|"jawwalPay"|"mahmoudWallet"|"held"|"nonReconciliationBank"|"uCashier"|"uBank";
 
 function scoreCandidate(
   cashierRow: CashierRow,
@@ -688,6 +767,12 @@ function doExport(
   bankRows: BankRow[] = [],
   cashierRows: CashierRow[] = [],
   resumeData?: ResumeData,
+  nonReconciliationBankRows: BankRow[] = [],
+  bankSplits: BankSplit[] = [],
+  cutoffBatches: CutoffBatch[] = [],
+  clearingGroups: ClearingGroup[] = [],
+  sourceCashierRows: CashierRow[] = [],
+  sourceBankRows: BankRow[] = [],
 ) {
   const wb = XLSX.utils.book_new();
   const usedSheetNames = new Set<string>();
@@ -723,6 +808,48 @@ function doExport(
     ["حوالات بلا فواتير · دائن", results.filter(r => r.type === "unmatchedBank" && r.bank.credit > 0).length, results.filter(r => r.type === "unmatchedBank").reduce((sum, r) => sum + r.bank.credit, 0)],
   ];
   add("غير المطابقات مدين ودائن", ["الفئة","العدد","الإجمالي بدون طرح الدائن"], unmatchedFinancialRows);
+  add("معلقات البنك غير التابعة للمطابقة",
+    ["التاريخ","البيان","النوع","مدين","دائن","المبلغ","نوع الحساب"],
+    nonReconciliationBankRows.map(row => [row.date, row.description, row.type, row.debit, row.credit, row.rawAmount, row.accountType || "—"]));
+  const sourceCashierByKey = new Map(sourceCashierRows.map(row => [transactionKey(row), row]));
+  const sourceBankByKey = new Map(sourceBankRows.map(row => [transactionKey(row), row]));
+  const splitRows = bankSplits.flatMap(split => split.allocations.map((allocation, index) => {
+    const bank = sourceBankByKey.get(`${split.bankSessionId}:${split.bankId}`);
+    const cashier = allocation.kind === "company" && allocation.cashierId != null
+      ? sourceCashierByKey.get(`${allocation.cashierSessionId ?? 0}:${allocation.cashierId}`)
+      : undefined;
+    return [
+      split.date, split.description, split.originalAmount, bank?.ref ?? "", bank?.accountType ?? "",
+      index + 1, allocation.kind === "company" ? "حصة شركتكم" : "حصة خارجية",
+      allocation.amount, allocation.note, cashier?.date ?? "", cashier?.name ?? "",
+      cashier?.ref ?? "", cashier?.matchAmount ?? "", allocation.cashierId ?? "",
+      allocation.cashierSessionId ?? "", split.savedAt,
+    ];
+  }));
+  add("تجزئة الحوالات", ["تاريخ الحوالة","بيان الحوالة الأصلية","قيمة الأصل","مرجع الحوالة","حساب الحوالة","رقم الحصة","التخصيص","مبلغ الحصة","ملاحظة التخصيص","تاريخ الفاتورة","اسم الفاتورة أو السند","مرجع الفاتورة","مبلغ الفاتورة","معرّف الفاتورة","جلسة الفاتورة","تاريخ التجزئة"], splitRows);
+  const cutoffRows = cutoffBatches.flatMap(batch => batch.sourceRows.map((source, index) => {
+    const target = sourceCashierByKey.get(`${batch.aggregateSessionId}:${batch.aggregateId}`);
+    const detail = sourceCashierByKey.get(`${source.sessionId}:${source.id}`);
+    return [
+      batch.dateFrom, batch.dateTo, batch.graceDays, target?.date ?? "", target?.name ?? "",
+      target?.ref ?? "", target?.matchAmount ?? "", batch.aggregateId, batch.aggregateSessionId,
+      index + 1, detail?.date ?? "", detail?.name ?? "", detail?.ref ?? "",
+      detail?.type ?? "", detail?.matchAmount ?? "", source.id, source.sessionId,
+      batch.total, batch.note, batch.savedAt,
+    ];
+  }));
+  add("تجميع فترة التعطل", ["من تاريخ","إلى تاريخ","نافذة التداخل بالأيام","تاريخ سند الإجمالي","اسم سند الإجمالي","مرجع سند الإجمالي","قيمة سند الإجمالي","معرّف سند الإجمالي","جلسة سند الإجمالي","رقم الفاتورة","تاريخ الفاتورة الفعلية","اسم الفاتورة الفعلية","مرجع الفاتورة","الاتجاه","قيمة الفاتورة","معرّف الفاتورة الفعلية","جلسة الفاتورة","إجمالي المجموعة","ملاحظة تدقيقية","تاريخ الحفظ"], cutoffRows);
+  const clearingRows = clearingGroups.flatMap(group => [
+    ...group.debitRows.map((reference, index) => {
+      const row = sourceCashierByKey.get(`${reference.sessionId}:${reference.id}`);
+      return ["مدين", group.id, row?.date ?? "", row?.name ?? "", row?.ref ?? "", row?.debit ?? "", reference.id, reference.sessionId, index + 1, group.total, group.note, group.savedAt];
+    }),
+    ...group.creditRows.map((reference, index) => {
+      const row = sourceCashierByKey.get(`${reference.sessionId}:${reference.id}`);
+      return ["دائن", group.id, row?.date ?? "", row?.name ?? "", row?.ref ?? "", row?.credit ?? "", reference.id, reference.sessionId, index + 1, group.total, group.note, group.savedAt];
+    }),
+  ]);
+  add("تسكير السندات", ["الطرف","معرّف مجموعة التسكير","التاريخ","بيان الحركة","المرجع","مبلغ الحركة","معرّف الحركة","جلسة الحركة","رقم الحركة في الطرف","المبلغ المتساوي","ملاحظة تدقيقية","تاريخ الحفظ"], clearingRows);
 
   const savedRows = results.filter(r=>r.type==="saved").map((r:any) => {
     const sm = r.savedMatch as SavedMatch;
@@ -863,6 +990,42 @@ type ResumeData = {
   heldItems: HeldItem[];
   returnedHeldBank?: BankRow[];
   returnedHeldCashier?: BankRow[] | CashierRow[];
+  bankSplits?: BankSplit[];
+  cutoffBatches?: CutoffBatch[];
+  clearingGroups?: ClearingGroup[];
+  nameAliases?: Record<string, string>;
+  rejectedSpecialCashierIds?: number[];
+  amountTolerancePercent?: number;
+  bankFileSnapshots?: FileSnapshot[];
+  cashFileSnapshots?: FileSnapshot[];
+  walletBankFileSnapshots?: FileSnapshot[];
+  walletCashFileSnapshots?: FileSnapshot[];
+  jawwalBankFileSnapshots?: FileSnapshot[];
+  jawwalCashFileSnapshots?: FileSnapshot[];
+  stageAInvoices?: StageAResult[];
+  walletBankHeaders?: string[];
+  walletBankRows?: Record<string, unknown>[];
+  walletBankMap?: { date: string; desc: string; debit: string; credit: string; ref: string };
+  walletBankSwap?: boolean;
+  walletBankFileSessionId?: number;
+  walletCashHeaders?: string[];
+  walletCashRows?: Record<string, unknown>[];
+  walletCashMap?: { date: string; name: string; debit: string; credit: string; ref: string };
+  walletCashSwap?: boolean;
+  walletCashFileSessionId?: number;
+  jawwalBankHeaders?: string[];
+  jawwalBankRows?: Record<string, unknown>[];
+  jawwalBankMap?: { date: string; desc: string; debit: string; credit: string; ref: string; totalAmount: string; movementAmount: string; direction: string };
+  jawwalBankSwap?: boolean;
+  jawwalBankOptions?: { useTotalAmount: boolean; readDebitCredit: boolean };
+  jawwalBankFileSessionId?: number;
+  jawwalCashHeaders?: string[];
+  jawwalCashRows?: Record<string, unknown>[];
+  jawwalCashMap?: { date: string; name: string; debit: string; credit: string; ref: string };
+  jawwalCashSwap?: boolean;
+  jawwalCashFileSessionId?: number;
+  platformNames?: { bank: string; wallet: string; jawwal: string };
+  customPlatforms?: CustomPlatform[];
 };
 
 const RESUME_SHEET_NAME = "⚙️ بيانات_الاستكمال";
@@ -870,10 +1033,9 @@ const RESUME_CHUNK_SIZE = 25000;
 
 function embedResumeSheet(wb: XLSX.WorkBook, data: ResumeData) {
   const json = JSON.stringify(data);
-  const MAX_JSON_SIZE = 4_000_000;
+  const MAX_JSON_SIZE = 50_000_000;
   if (json.length > MAX_JSON_SIZE) {
-    console.warn(`بيانات الجلسة كبيرة جداً (${json.length} حرف) لتضمينها بالملف - تم تجاهل خاصية الاستكمال لهالمرة.`);
-    return;
+    throw new Error(`بيانات الاستكمال كبيرة جداً (${json.length.toLocaleString()} حرف) لإضافتها إلى ملف Excel. نزّل الملفات بعد تقليل بيانات الجلسة أو قسّم العمل إلى مشروعين.`);
   }
   const chunks: string[] = [];
   for (let i = 0; i < json.length; i += RESUME_CHUNK_SIZE) {
@@ -887,38 +1049,78 @@ function embedResumeSheet(wb: XLSX.WorkBook, data: ResumeData) {
   XLSX.utils.book_append_sheet(wb, ws, RESUME_SHEET_NAME);
 }
 
-async function extractResumeData(file: File): Promise<ResumeData | null> {
+async function extractResumeData(file: File): Promise<ResumeData> {
+  const buf = await readFileBuf(file);
+  let wb: XLSX.WorkBook;
   try {
-    const buf = await readFileBuf(file);
-    const wb = XLSX.read(buf, { type: "array" });
-    const sheetName = wb.SheetNames.find(n => n === RESUME_SHEET_NAME || n.includes("استكمال"));
-    if (!sheetName) return null;
-    const ws = wb.Sheets[sheetName];
-    const rows = XLSX.utils.sheet_to_json<any[]>(ws, { header: 1 });
-    const json = rows.slice(1).map(r => (r?.[0] ?? "")).join("");
-    if (!json.trim()) return null;
-    return JSON.parse(json) as ResumeData;
+    wb = XLSX.read(buf, { type: "array", cellDates: true });
   } catch {
-    return null;
+    throw new Error("تعذّرت قراءة ملف Excel. تأكد أن الملف سليم وغير محمي بكلمة مرور.");
   }
+  const sheetName = wb.SheetNames.find(name => name === RESUME_SHEET_NAME || name.includes("بيانات_الاستكمال") || name.includes("استكمال"));
+  if (!sheetName) {
+    throw new Error("لم يُعثر على شيت بيانات الاستكمال. استورد ملف Excel الذي نزلته من زر «تصدير Excel» في المنصة، ولا تحذف شيت «بيانات_الاستكمال» منه.");
+  }
+  const worksheet = wb.Sheets[sheetName];
+  if (!worksheet || !worksheet["!ref"]) throw new Error("شيت بيانات الاستكمال فارغ أو غير صالح.");
+  const range = XLSX.utils.decode_range(worksheet["!ref"]);
+  const chunks: string[] = [];
+  for (let row = range.s.r + 1; row <= range.e.r; row++) {
+    const cell = worksheet[XLSX.utils.encode_cell({ r: row, c: range.s.c })];
+    if (cell?.v != null) chunks.push(String(cell.v));
+  }
+  const json = chunks.join("");
+  if (!json.trim()) throw new Error("شيت الاستكمال موجود لكنه لا يحتوي على بيانات. أعد تصدير الملف من المنصة.");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    throw new Error("بيانات الاستكمال في الملف غير مكتملة أو معدّلة. نزّل نسخة جديدة من زر «تصدير Excel» وحاول استيرادها.");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("تنسيق بيانات الاستكمال غير صحيح.");
+  }
+  const data = parsed as Partial<ResumeData>;
+  const requiredArrays: Array<keyof ResumeData> = [
+    "bankHeaders", "bankRowsRaw", "cashHeaders", "cashRowsRaw",
+    "manualGroups", "savedMatches", "rejectedPairs", "visaItems", "heldItems",
+  ];
+  if (requiredArrays.some(key => !Array.isArray(data[key])) || !data.bankMap || !data.cashMap) {
+    throw new Error("ملف الاستكمال لا يحتوي على كل بيانات الكشوف الأساسية المطلوبة.");
+  }
+  return {
+    ...data,
+    bankSplits: data.bankSplits ?? [],
+    cutoffBatches: data.cutoffBatches ?? [],
+    clearingGroups: data.clearingGroups ?? [],
+  } as ResumeData;
 }
 
 function autoDetect(headers: string[], hints: string[]): string {
-  const scores=headers.map(h=>({h,s:hints.reduce((a,hint)=>a+(h.toLowerCase().includes(hint.toLowerCase())?1:0),0)})).sort((a,b)=>b.s-a.s);
+  const normalize=(value:string)=>value.toLowerCase().replace(/[_-]+/g," ").replace(/\s+/g," ").trim();
+  const scores=headers.map(h=>({h,s:hints.reduce((score,hint)=>{
+    const normalizedHeader=normalize(h), normalizedHint=normalize(hint);
+    if (normalizedHeader===normalizedHint) return score+4;
+    if (normalizedHint.length>2 && normalizedHeader.includes(normalizedHint)) return score+1;
+    return score;
+  },0)})).sort((a,b)=>b.s-a.s);
   return scores[0]?.s>0?scores[0].h:"";
 }
 const HINTS={
   date:   ["date","تاريخ","value","posting"],
   desc:   ["description","narrative","detail","إيضاح","بيان","وصف","narr","payee","particular"],
-  debit:  ["debit","مدين","مستلم","مبالغ مستلمة","received","deposit","cr","دخول","إيداع"],
-  credit: ["credit","دائن","مدفوع","مبالغ مدفوعة","paid","withdrawal","dr","خروج","سحب"],
+  debit:  ["debit","مدين","مستلم","مبالغ مستلمة","received","deposit","money in","دخول","إيداع"],
+  credit: ["credit","دائن","مدفوع","مبالغ مدفوعة","paid","withdrawal","money out","خروج","سحب"],
   name:   ["name","اسم","customer","client","employee","موظف","عميل","الزبون","بيان","وصف","narrative","detail","إيضاح"],
   accountType: ["account type","account_type","نوع الحساب","نوع حساب","نوع","حساب","account"],
   ref:    ["reference","ref","transaction","trx","id","reference no","reference number","مرجع","رقم المرجع","رقم الحركة","رقم الحوالة","transaction id","txn","voucher","سند","رقم"],
+  totalAmount: ["المبلغ الكلي","total amount","gross amount"],
+  movementAmount: ["مبلغ الحركة","transaction amount","amount"],
+  direction: ["مدين/دائن","مدين دائن","debit credit","transaction side","نوع القيد"],
 };
 
 // ─── DropZone ─────────────────────────────────────────────────────────────────
-function DropZone({ file, onFile, onClear }: { file:File|null; onFile:(f:File)=>void; onClear:()=>void }) {
+function DropZone({ file, onFile, onClear, headers = [], rows = [] }: { file:File|null; onFile:(f:File)=>void; onClear:()=>void; headers?:string[]; rows?:Record<string, unknown>[] }) {
   const handleDrop=useCallback((e:React.DragEvent)=>{e.preventDefault();const f=e.dataTransfer.files[0];if(f)onFile(f);},[onFile]);
   if (file) return (
     <div className="flex items-center justify-between gap-3 p-3.5 bg-blue-500/5 border border-blue-500/25 rounded-lg">
@@ -926,13 +1128,14 @@ function DropZone({ file, onFile, onClear }: { file:File|null; onFile:(f:File)=>
         <FileSpreadsheet className="w-4 h-4 text-blue-600 shrink-0"/>
         <div><div className="text-sm font-medium">{file.name}</div><div className="text-xs text-muted-foreground">{(file.size/1024).toFixed(1)} KB</div></div>
       </div>
-      <button onClick={onClear} className="p-1 hover:bg-muted rounded transition-colors text-muted-foreground"><X className="w-4 h-4"/></button>
+      {headers.length > 0 && rows.length > 0 && <button onClick={() => downloadCleanedSheet(file.name, headers, rows)} className="flex items-center gap-1 rounded-md bg-emerald-50 px-2 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100"><Download className="h-3.5 w-3.5"/>تنزيل Excel</button>}
+      <button onClick={onClear} aria-label="حذف الملف" title="حذف الملف" className="p-1 hover:bg-muted rounded transition-colors text-muted-foreground"><X className="w-4 h-4"/></button>
     </div>
   );
   return (
     <label onDrop={handleDrop} onDragOver={e=>e.preventDefault()}
       className="flex flex-col items-center gap-2 p-6 border-2 border-dashed border-border rounded-lg cursor-pointer hover:border-blue-500/50 hover:bg-muted/10 transition-all">
-      <input type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={e=>{const f=e.target.files?.[0];if(f)onFile(f);}}/>
+      <input type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={e=>{const f=e.target.files?.[0];if(f)onFile(f);e.currentTarget.value="";}}/>
       <Upload className="w-6 h-6 text-muted-foreground"/>
       <span className="text-sm">اسحب ملف الكشف أو انقر هنا</span>
       <span className="text-xs text-muted-foreground">xlsx · xls · csv</span>
@@ -1426,8 +1629,42 @@ interface SavedProject {
   heldItems: HeldItem[];
   returnedHeldBank?: BankRow[];
   returnedHeldCashier?: CashierRow[];
+  bankSplits?: BankSplit[];
+  cutoffBatches?: CutoffBatch[];
+  clearingGroups?: ClearingGroup[];
+  nameAliases?: Record<string, string>;
+  rejectedSpecialCashierIds?: number[];
+  amountTolerancePercent?: number;
+  bankFileSnapshots?: FileSnapshot[];
+  cashFileSnapshots?: FileSnapshot[];
+  walletBankFileSnapshots?: FileSnapshot[];
+  walletCashFileSnapshots?: FileSnapshot[];
+  jawwalBankFileSnapshots?: FileSnapshot[];
+  jawwalCashFileSnapshots?: FileSnapshot[];
+  stageAInvoices?: StageAResult[];
+  walletBankHeaders?: string[];
+  walletBankRows?: Record<string, unknown>[];
+  walletBankMap?: { date: string; desc: string; debit: string; credit: string; ref: string };
+  walletBankSwap?: boolean;
+  walletCashHeaders?: string[];
+  walletCashRows?: Record<string, unknown>[];
+  walletCashMap?: { date: string; name: string; debit: string; credit: string; ref: string };
+  walletCashSwap?: boolean;
+  jawwalBankHeaders?: string[];
+  jawwalBankRows?: Record<string, unknown>[];
+  jawwalBankMap?: { date: string; desc: string; debit: string; credit: string; ref: string; totalAmount: string; movementAmount: string; direction: string };
+  jawwalBankSwap?: boolean;
+  jawwalCashHeaders?: string[];
+  jawwalCashRows?: Record<string, unknown>[];
+  jawwalCashMap?: { date: string; name: string; debit: string; credit: string; ref: string };
+  jawwalCashSwap?: boolean;
   platformNames?: { bank: string; wallet: string; jawwal: string };
   customPlatforms?: CustomPlatform[];
+  walletBankFileSessionId?: number;
+  walletCashFileSessionId?: number;
+  jawwalBankFileSessionId?: number;
+  jawwalCashFileSessionId?: number;
+  jawwalBankOptions?: { useTotalAmount: boolean; readDebitCredit: boolean };
 }
 
 async function loadProjectsList(): Promise<SavedProject[]> {
@@ -1684,7 +1921,25 @@ function MatchDrawer({
 }
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
-function ReportPage({ bank, cashier, results, onBack }: { bank: BankRow[]; cashier: CashierRow[]; results: MatchResult[] | null; onBack: () => void }) {
+function ReportPage({
+  bank,
+  cashier,
+  results,
+  bankSplits,
+  cutoffBatches,
+  clearingGroups,
+  sourceCashierRows,
+  onBack,
+}: {
+  bank: BankRow[];
+  cashier: CashierRow[];
+  results: MatchResult[] | null;
+  bankSplits: BankSplit[];
+  cutoffBatches: CutoffBatch[];
+  clearingGroups: ClearingGroup[];
+  sourceCashierRows: CashierRow[];
+  onBack: () => void;
+}) {
   const [visibleMatchedCount, setVisibleMatchedCount] = useState(5);
   const netTotal = (rows: Array<BankRow | CashierRow>) => rows.reduce((sum, row) => sum + row.debit - row.credit, 0);
   const bankTotal = netTotal(bank);
@@ -1796,7 +2051,7 @@ function ReportPage({ bank, cashier, results, onBack }: { bank: BankRow[]; cashi
             <button onClick={onBack} className="flex items-center gap-2 rounded-xl border bg-card px-4 py-2.5 text-sm font-semibold hover:bg-muted"><ArrowUpRight className="h-4 w-4 rotate-180" /> العودة إلى مساحة العمل</button>
           </div>
         </header>
-        {!bank.length && !cashier.length ? (
+        {!bank.length && !cashier.length && !clearingGroups.length ? (
           <div className="rounded-2xl border border-dashed bg-card p-12 text-center">
             <BarChart3 className="mx-auto mb-4 h-10 w-10 text-muted-foreground/50" />
             <h2 className="font-bold">لا يوجد كشف محفوظ بعد</h2>
@@ -1829,6 +2084,58 @@ function ReportPage({ bank, cashier, results, onBack }: { bank: BankRow[]; cashi
                 ))}
               </div>
             </section>
+            {(bankSplits.length > 0 || cutoffBatches.length > 0) && (
+              <section className="space-y-5 rounded-2xl border border-violet-200 bg-violet-50/40 p-5 sm:p-6">
+                <div>
+                  <h2 className="font-bold">تفصيل أدوات التجزئة وتجميع فترة التعطل</h2>
+                  <p className="mt-1 text-xs text-muted-foreground">سجل تدقيقي مساعد يوضح التوزيعات والمجاميع دون إنشاء قيود في النظام المحاسبي.</p>
+                </div>
+                {bankSplits.length > 0 && <div className="space-y-2">
+                  <h3 className="text-sm font-semibold">تجزئة الحوالات</h3>
+                  <div className="overflow-x-auto rounded-xl border bg-card">
+                    <table className="w-full min-w-[780px] text-xs">
+                      <thead className="bg-muted"><tr>
+                        <th className="px-3 py-2 text-right">الحوالة</th><th className="px-3 py-2 text-right">قيمة الأصل</th><th className="px-3 py-2 text-right">التخصيص</th><th className="px-3 py-2 text-right">المبلغ</th><th className="px-3 py-2 text-right">التوضيح</th>
+                      </tr></thead>
+                      <tbody>{bankSplits.flatMap(split => split.allocations.map((allocation, index) => {
+                        const cashierRow = allocation.kind === "company"
+                          ? sourceCashierRows.find(row => row.id === allocation.cashierId && (row._fileSessionId ?? 0) === (allocation.cashierSessionId ?? 0))
+                          : null;
+                        return <tr key={`${split.id}:${allocation.id}`} className="border-t">
+                          <td className="px-3 py-2">{split.date} · {split.description} · حصة {index + 1}</td>
+                          <td className="px-3 py-2 font-mono">{fmtNum(split.originalAmount)}</td>
+                          <td className="px-3 py-2">{allocation.kind === "company" ? `شركتنا${cashierRow ? ` · ${cashierRow.name}` : ""}` : "جهة خارجية"}</td>
+                          <td className="px-3 py-2 font-mono">{fmtNum(allocation.amount)}</td>
+                          <td className="px-3 py-2">{allocation.note || "—"}</td>
+                        </tr>;
+                      }) )}</tbody>
+                    </table>
+                  </div>
+                </div>}
+                {cutoffBatches.length > 0 && <div className="space-y-2">
+                  <h3 className="text-sm font-semibold">تجميع فترة التعطل</h3>
+                  <div className="overflow-x-auto rounded-xl border bg-card">
+                    <table className="w-full min-w-[850px] text-xs">
+                      <thead className="bg-muted"><tr>
+                        <th className="px-3 py-2 text-right">الفترة</th><th className="px-3 py-2 text-right">سند الإجمالي</th><th className="px-3 py-2 text-right">الفواتير الحقيقية</th><th className="px-3 py-2 text-right">عددها</th><th className="px-3 py-2 text-right">نافذة التداخل</th><th className="px-3 py-2 text-right">ملاحظة</th>
+                      </tr></thead>
+                      <tbody>{cutoffBatches.map(batch => {
+                        const aggregate = sourceCashierRows.find(row => row.id === batch.aggregateId && (row._fileSessionId ?? 0) === batch.aggregateSessionId);
+                        const sources = batch.sourceRows.map(reference => sourceCashierRows.find(row => row.id === reference.id && (row._fileSessionId ?? 0) === reference.sessionId)).filter((row): row is CashierRow => !!row);
+                        return <tr key={batch.id} className="border-t align-top">
+                          <td className="px-3 py-2">{batch.dateFrom} إلى {batch.dateTo}</td>
+                          <td className="px-3 py-2">{aggregate?.name || "سند إجمالي"} · {fmtNum(batch.total)}</td>
+                          <td className="px-3 py-2">{sources.map(row => `${row.date} · ${row.name} (${fmtNum(row.matchAmount)})`).join("، ")}</td>
+                          <td className="px-3 py-2">{sources.length}</td>
+                          <td className="px-3 py-2">{batch.graceDays ? `±${batch.graceDays} يوم` : "الفترة المحددة"}</td>
+                          <td className="px-3 py-2">{batch.note || "—"}</td>
+                        </tr>;
+                      })}</tbody>
+                    </table>
+                  </div>
+                </div>}
+              </section>
+            )}
             <section className="report-channel-section report-page-break-after rounded-2xl border bg-card p-5 sm:p-6">
               <div className="mb-4">
                 <h2 className="font-bold">تفصيل القنوات المالية</h2>
@@ -1969,6 +2276,29 @@ function ReportPage({ bank, cashier, results, onBack }: { bank: BankRow[]; cashi
                 )}
               </div>
             </section>
+            {clearingGroups.length > 0 && <section className="rounded-2xl border bg-card p-5 sm:p-6">
+              <h2 className="font-bold">الحركات المسكّرة يدوياً ({clearingGroups.length} مجموعة)</h2>
+              <p className="mt-1 text-xs text-muted-foreground">هذه الحركات عُزلت من العناصر المفتوحة بعد التحقق من تساوي المدين والدائن.</p>
+              <div className="mt-4 space-y-3">
+                {clearingGroups.map(group => {
+                  const getRows = (references: CutoffRowRef[]) => references.map(reference =>
+                    sourceCashierRows.find(row => row.id === reference.id && (row._fileSessionId ?? 0) === reference.sessionId)
+                  );
+                  const debits = getRows(group.debitRows);
+                  const credits = getRows(group.creditRows);
+                  return <article key={group.id} className="rounded-xl border p-3">
+                    <div className="flex flex-wrap justify-between gap-2 text-sm font-semibold"><span>مجموعة {group.id}</span><span className="font-mono">{fmtNum(group.total)} ₪</span></div>
+                    <div className="mt-2 grid gap-3 md:grid-cols-2">
+                      {[{ label: "مدين", rows: debits }, { label: "دائن", rows: credits }].map(side => <div key={side.label} className="space-y-1">
+                        <p className="text-xs font-semibold">{side.label}</p>
+                        {side.rows.map((row, index) => <p key={`${group.id}-${side.label}-${index}`} className="flex justify-between gap-2 rounded bg-muted/40 px-2 py-1.5 text-xs"><span>{row ? `${row.date} · ${row.name}` : "حركة غير متاحة في المصدر الحالي"}</span><b className="font-mono">{row ? fmtNum(side.label === "مدين" ? row.debit : row.credit) : "—"}</b></p>)}
+                      </div>)}
+                    </div>
+                    {group.note && <p className="mt-2 text-xs text-muted-foreground">{group.note}</p>}
+                  </article>;
+                })}
+              </div>
+            </section>}
           </>
         )}
       </div>
@@ -1976,7 +2306,7 @@ function ReportPage({ bank, cashier, results, onBack }: { bank: BankRow[]; cashi
   );
 }
 
-type PageId = "main" | "manual" | "assist" | "report" | "recon2" | "recon2StageA" | "recon2Visa";
+type PageId = "main" | "manual" | "assist" | "report" | "recon2" | "recon2StageA" | "recon2Visa" | "splitTool" | "batchCutoff" | "clearing";
 
 export default function App({ initialPage = "recon2" }: { initialPage?: PageId } = {}) {
   const [page, setPage] = useState<PageId>(initialPage);
@@ -2004,32 +2334,32 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   const [walletBankRows, setWalletBankRows] = useState<Record<string,unknown>[]>([]);
   const [walletBankMap, setWalletBankMap] = useState({ date:"", desc:"", debit:"", credit:"", ref:"" });
   const [walletBankSwap, setWalletBankSwap] = useState(false);
+  const [walletBankFileSessionId, setWalletBankFileSessionId] = useState(0);
   const [walletCashFile, setWalletCashFile] = useState<File|null>(null);
   const [walletCashHeaders, setWalletCashHeaders] = useState<string[]>([]);
   const [walletCashRows, setWalletCashRows] = useState<Record<string,unknown>[]>([]);
   const [walletCashMap, setWalletCashMap] = useState({ date:"", name:"", debit:"", credit:"", ref:"" });
   const [walletCashSwap, setWalletCashSwap] = useState(false);
+  const [walletCashFileSessionId, setWalletCashFileSessionId] = useState(0);
   const [jawwalBankFile, setJawwalBankFile] = useState<File|null>(null);
   const [jawwalBankHeaders, setJawwalBankHeaders] = useState<string[]>([]);
   const [jawwalBankRows, setJawwalBankRows] = useState<Record<string,unknown>[]>([]);
-  const [jawwalBankMap, setJawwalBankMap] = useState({ date:"", desc:"", debit:"", credit:"", ref:"" });
+  const [jawwalBankMap, setJawwalBankMap] = useState({ date:"", desc:"", debit:"", credit:"", ref:"", totalAmount:"", movementAmount:"", direction:"" });
   const [jawwalBankSwap, setJawwalBankSwap] = useState(false);
+  const [jawwalBankOptions, setJawwalBankOptions] = useState({ useTotalAmount: true, readDebitCredit: true });
+  const [jawwalBankFileSessionId, setJawwalBankFileSessionId] = useState(0);
   const [jawwalCashFile, setJawwalCashFile] = useState<File|null>(null);
   const [jawwalCashHeaders, setJawwalCashHeaders] = useState<string[]>([]);
   const [jawwalCashRows, setJawwalCashRows] = useState<Record<string,unknown>[]>([]);
   const [jawwalCashMap, setJawwalCashMap] = useState({ date:"", name:"", debit:"", credit:"", ref:"" });
   const [jawwalCashSwap, setJawwalCashSwap] = useState(false);
+  const [jawwalCashFileSessionId, setJawwalCashFileSessionId] = useState(0);
+  const nextCustomSourceSessionId = useRef(1);
   const [platformNames, setPlatformNames] = useState({ bank: "بنك فلسطين", wallet: "بال بي", jawwal: "جوال بي" });
   const [customPlatforms, setCustomPlatforms] = useState<CustomPlatform[]>([]);
   const nextCustomPlatformId = useRef(0);
 
   // ─── File snapshots for restore functionality ──────────────────────────────
-  interface FileSnapshot {
-    label: string;
-    headers: string[];
-    rows: Record<string, unknown>[];
-    savedAt: string;
-  }
   const [bankFileSnapshots, setBankFileSnapshots] = useState<FileSnapshot[]>([]);
   const [cashFileSnapshots, setCashFileSnapshots] = useState<FileSnapshot[]>([]);
   const [walletBankFileSnapshots, setWalletBankFileSnapshots] = useState<FileSnapshot[]>([]);
@@ -2050,6 +2380,9 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
 
   const [manualGroups, setManualGroups]     = useState<ManualMatchGroup[]>([]);
   const [savedMatches, setSavedMatches]     = useState<SavedMatch[]>([]);
+  const [bankSplits, setBankSplits] = useState<BankSplit[]>([]);
+  const [cutoffBatches, setCutoffBatches] = useState<CutoffBatch[]>([]);
+  const [clearingGroups, setClearingGroups] = useState<ClearingGroup[]>([]);
   const [nameAliases, setNameAliases]       = useState<Record<string, string>>({});
   const [rejectedPairs, setRejected]        = useState<Set<string>>(new Set());
   const [expandedMatchKey, setExpandedMatchKey] = useState<string|null>(null);
@@ -2104,20 +2437,26 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         setWalletBankRows(session.walletBankRows || []);
         setWalletBankMap({ date:"", desc:"", debit:"", credit:"", ref:"", ...(session.walletBankMap || {}) });
         setWalletBankSwap(!!session.walletBankSwap);
+        setWalletBankFileSessionId(session.walletBankFileSessionId ?? 0);
         setWalletCashHeaders(session.walletCashHeaders || []);
         setWalletCashRows(session.walletCashRows || []);
         setWalletCashMap({ date:"", name:"", debit:"", credit:"", ref:"", ...(session.walletCashMap || {}) });
         setWalletCashSwap(!!session.walletCashSwap);
+        setWalletCashFileSessionId(session.walletCashFileSessionId ?? 0);
         setJawwalBankHeaders(session.jawwalBankHeaders || []);
         setJawwalBankRows(session.jawwalBankRows || []);
-        setJawwalBankMap({ date:"", desc:"", debit:"", credit:"", ref:"", ...(session.jawwalBankMap || {}) });
+        setJawwalBankMap({ date:"", desc:"", debit:"", credit:"", ref:"", totalAmount:"", movementAmount:"", direction:"", ...(session.jawwalBankMap || {}) });
         setJawwalBankSwap(!!session.jawwalBankSwap);
+        setJawwalBankOptions({ useTotalAmount: true, readDebitCredit: true, ...(session.jawwalBankOptions || {}) });
+        setJawwalBankFileSessionId(session.jawwalBankFileSessionId ?? 0);
         setJawwalCashHeaders(session.jawwalCashHeaders || []);
         setJawwalCashRows(session.jawwalCashRows || []);
         setJawwalCashMap({ date:"", name:"", debit:"", credit:"", ref:"", ...(session.jawwalCashMap || {}) });
         setJawwalCashSwap(!!session.jawwalCashSwap);
+        setJawwalCashFileSessionId(session.jawwalCashFileSessionId ?? 0);
         setPlatformNames({ bank: "بنك فلسطين", wallet: "بال بي", jawwal: "جوال بي", ...(session.platformNames || {}) });
         setCustomPlatforms(session.customPlatforms || []);
+        nextCustomSourceSessionId.current = Math.max(1, ...(session.customPlatforms || []).flatMap((platform: CustomPlatform) => [platform.transfer?.fileSessionId ?? 0, platform.invoice?.fileSessionId ?? 0]).map((id: number) => id + 1));
         nextCustomPlatformId.current = Math.max(0, ...(session.customPlatforms || []).map((platform: CustomPlatform) => platform.id + 1));
         setBankFileSnapshots(session.bankFileSnapshots || []);
         setCashFileSnapshots(session.cashFileSnapshots || []);
@@ -2127,10 +2466,13 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         setJawwalCashFileSnapshots(session.jawwalCashFileSnapshots || []);
         setManualGroups(session.manualGroups || []);
         setSavedMatches(session.savedMatches || []);
+        setBankSplits(session.bankSplits || []);
+        setCutoffBatches(session.cutoffBatches || []);
+        setClearingGroups(session.clearingGroups || []);
         setNameAliases(session.nameAliases || {});
         setRejected(new Set(session.rejectedPairs || []));
         setVisaItems(session.visaItems || []);
-        setHeldItems(session.heldItems || []);
+        setHeldItems(dedupeHeldItems(session.heldItems || []));
         setReturnedHeldBank(session.returnedHeldBank || []);
         setReturnedHeldCashier(session.returnedHeldCashier || []);
         setRejectedSpecialCashierIds(normalizeIdSet(session.rejectedSpecialCashierIds));
@@ -2148,14 +2490,14 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       storageSet("current_session", {
         bankHeaders, bankRowsRaw, bankMap, bankSwap, bankFileSessionId,
         cashHeaders, cashRowsRaw, cashMap, cashSwap, cashFileSessionId, stageAInvoices,
-        walletBankHeaders, walletBankRows, walletBankMap, walletBankSwap,
-        walletCashHeaders, walletCashRows, walletCashMap, walletCashSwap,
-        jawwalBankHeaders, jawwalBankRows, jawwalBankMap, jawwalBankSwap,
-        jawwalCashHeaders, jawwalCashRows, jawwalCashMap, jawwalCashSwap,
+        walletBankHeaders, walletBankRows, walletBankMap, walletBankSwap, walletBankFileSessionId,
+        walletCashHeaders, walletCashRows, walletCashMap, walletCashSwap, walletCashFileSessionId,
+        jawwalBankHeaders, jawwalBankRows, jawwalBankMap, jawwalBankSwap, jawwalBankOptions, jawwalBankFileSessionId,
+        jawwalCashHeaders, jawwalCashRows, jawwalCashMap, jawwalCashSwap, jawwalCashFileSessionId,
         platformNames, customPlatforms,
         bankFileSnapshots, cashFileSnapshots, walletBankFileSnapshots, walletCashFileSnapshots,
         jawwalBankFileSnapshots, jawwalCashFileSnapshots,
-        manualGroups, savedMatches, nameAliases,
+        manualGroups, savedMatches, bankSplits, cutoffBatches, clearingGroups, nameAliases,
         rejectedPairs: Array.from(rejectedPairs),
         visaItems, heldItems, returnedHeldBank, returnedHeldCashier,
         rejectedSpecialCashierIds: Array.from(rejectedSpecialCashierIds)
@@ -2165,14 +2507,14 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   }, [
     sessionLoaded, bankHeaders, bankRowsRaw, bankMap, bankSwap, bankFileSessionId,
     cashHeaders, cashRowsRaw, cashMap, cashSwap, cashFileSessionId, stageAInvoices,
-    walletBankHeaders, walletBankRows, walletBankMap, walletBankSwap,
-    walletCashHeaders, walletCashRows, walletCashMap, walletCashSwap,
-    jawwalBankHeaders, jawwalBankRows, jawwalBankMap, jawwalBankSwap,
-    jawwalCashHeaders, jawwalCashRows, jawwalCashMap, jawwalCashSwap,
+    walletBankHeaders, walletBankRows, walletBankMap, walletBankSwap, walletBankFileSessionId,
+    walletCashHeaders, walletCashRows, walletCashMap, walletCashSwap, walletCashFileSessionId,
+    jawwalBankHeaders, jawwalBankRows, jawwalBankMap, jawwalBankSwap, jawwalBankOptions, jawwalBankFileSessionId,
+    jawwalCashHeaders, jawwalCashRows, jawwalCashMap, jawwalCashSwap, jawwalCashFileSessionId,
     platformNames, customPlatforms,
     bankFileSnapshots, cashFileSnapshots, walletBankFileSnapshots, walletCashFileSnapshots,
     jawwalBankFileSnapshots, jawwalCashFileSnapshots,
-    manualGroups, savedMatches, nameAliases, rejectedPairs,
+    manualGroups, savedMatches, bankSplits, cutoffBatches, clearingGroups, nameAliases, rejectedPairs,
     visaItems, heldItems, returnedHeldBank, returnedHeldCashier, rejectedSpecialCashierIds
   ]);
 
@@ -2203,6 +2545,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       const { headers, rows } = parseSheet(await readFileBuf(f));
       setWalletBankHeaders(headers); setWalletBankRows(rows);
       setWalletBankMap({ date:autoDetect(headers,HINTS.date), desc:autoDetect(headers,HINTS.desc), debit:autoDetect(headers,HINTS.debit), credit:autoDetect(headers,HINTS.credit), ref:autoDetect(headers,HINTS.ref) });
+      setWalletBankFileSessionId(id => id + 1);
       setWalletBankFileSnapshots(prev => [{ label: f.name, headers, rows, savedAt: new Date().toLocaleString("ar-SA") }, ...prev].slice(0, 5));
     } catch (e) { setError((e as Error).message); }
   };
@@ -2213,6 +2556,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       const { headers, rows } = parseSheet(await readFileBuf(f));
       setWalletCashHeaders(headers); setWalletCashRows(rows);
       setWalletCashMap({ date:autoDetect(headers,HINTS.date), name:autoDetect(headers,HINTS.name), debit:autoDetect(headers,HINTS.debit), credit:autoDetect(headers,HINTS.credit), ref:autoDetect(headers,HINTS.ref) });
+      setWalletCashFileSessionId(id => id + 1);
       setWalletCashFileSnapshots(prev => [{ label: f.name, headers, rows, savedAt: new Date().toLocaleString("ar-SA") }, ...prev].slice(0, 5));
     } catch (e) { setError((e as Error).message); }
   };
@@ -2221,7 +2565,21 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     try {
       const { headers, rows } = parseSheet(await readFileBuf(f));
       setJawwalBankHeaders(headers); setJawwalBankRows(rows);
-      setJawwalBankMap({ date:autoDetect(headers,HINTS.date), desc:autoDetect(headers,HINTS.desc), debit:autoDetect(headers,HINTS.debit), credit:autoDetect(headers,HINTS.credit), ref:autoDetect(headers,HINTS.ref) });
+      const totalAmount = autoDetect(headers, HINTS.totalAmount);
+      const direction = autoDetect(headers, HINTS.direction);
+      const debit = autoDetect(headers, HINTS.debit);
+      const credit = autoDetect(headers, HINTS.credit);
+      setJawwalBankMap({
+        date: autoDetect(headers, HINTS.date),
+        desc: autoDetect(headers, HINTS.desc),
+        debit: debit === direction ? "" : debit,
+        credit: credit === direction ? "" : credit,
+        ref: autoDetect(headers, HINTS.ref),
+        totalAmount,
+        movementAmount: autoDetect(headers, HINTS.movementAmount),
+        direction,
+      });
+      setJawwalBankFileSessionId(id => id + 1);
       setJawwalBankFileSnapshots(prev => [{ label: f.name, headers, rows, savedAt: new Date().toLocaleString("ar-SA") }, ...prev].slice(0, 5));
     } catch (e) { setError((e as Error).message); }
   };
@@ -2231,6 +2589,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       const { headers, rows } = parseSheet(await readFileBuf(f));
       setJawwalCashHeaders(headers); setJawwalCashRows(rows);
       setJawwalCashMap({ date:autoDetect(headers,HINTS.date), name:autoDetect(headers,HINTS.name), debit:autoDetect(headers,HINTS.debit), credit:autoDetect(headers,HINTS.credit), ref:autoDetect(headers,HINTS.ref) });
+      setJawwalCashFileSessionId(id => id + 1);
       setJawwalCashFileSnapshots(prev => [{ label: f.name, headers, rows, savedAt: new Date().toLocaleString("ar-SA") }, ...prev].slice(0, 5));
     } catch (e) { setError((e as Error).message); }
   };
@@ -2253,6 +2612,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         role: slot,
         otherName: "",
         otherRole: slot,
+        fileSessionId: nextCustomSourceSessionId.current++,
       };
       setCustomPlatforms((current) => current.map((platform) => platform.id === platformId ? { ...platform, [slot]: source } : platform));
     } catch (e) {
@@ -2261,7 +2621,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   };
 
   const parsedBank = useMemo(():BankRow[]=>{
-    return bankRowsRaw.map((r,i)=>{
+    return bankRowsRaw.map((r,i): BankRow | null => {
       const { debit, credit, rawAmount, type } = resolveDebitCredit(r, bankMap.debit, bankMap.credit, bankSwap);
       if (rawAmount === 0) return null;
       return {
@@ -2270,19 +2630,19 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         debit, credit, rawAmount, type,
         accountType: platformNames.bank,
         ref: String((bankMap as any).ref ? r[(bankMap as any).ref] : "").trim(),
-        orig:r
+        orig:r, _fileSessionId: bankFileSessionId
       };
     }).filter((r): r is BankRow => r !== null);
-  },[bankRowsRaw,bankMap,bankSwap,platformNames.bank]);
+  },[bankRowsRaw,bankMap,bankSwap,platformNames.bank,bankFileSessionId]);
 
-  const parseWalletBankRows = useMemo(():BankRow[] => walletBankRows.map((r,i) => {
+  const parseWalletBankRows = useMemo(():BankRow[] => walletBankRows.map((r,i): BankRow | null => {
     const { debit, credit, rawAmount, type } = resolveDebitCredit(r, walletBankMap.debit, walletBankMap.credit, walletBankSwap);
     if (!rawAmount) return null;
-    return { id: 1000000 + i, date:fmtDate(walletBankMap.date ? r[walletBankMap.date] : ""), description:String(walletBankMap.desc ? r[walletBankMap.desc] : "").trim(), debit, credit, rawAmount, type, accountType:platformNames.wallet, ref:String(walletBankMap.ref ? r[walletBankMap.ref] : "").trim(), orig:r };
-  }).filter((r): r is BankRow => r !== null), [walletBankRows, walletBankMap, walletBankSwap, platformNames.wallet]);
+    return { id: 1000000 + i, date:fmtDate(walletBankMap.date ? r[walletBankMap.date] : ""), description:String(walletBankMap.desc ? r[walletBankMap.desc] : "").trim(), debit, credit, rawAmount, type, accountType:platformNames.wallet, ref:String(walletBankMap.ref ? r[walletBankMap.ref] : "").trim(), orig:r, _fileSessionId:walletBankFileSessionId };
+  }).filter((r): r is BankRow => r !== null), [walletBankRows, walletBankMap, walletBankSwap, platformNames.wallet, walletBankFileSessionId]);
 
   const parsedCashier = useMemo(():CashierRow[]=>{
-    const rows = cashRowsRaw.map((r,i)=>{
+    const rows = cashRowsRaw.map((r,i): CashierRow | null => {
       const rawName=String(cashMap.name?r[cashMap.name]:"").trim();
       const {name,notes}=parseCashierName(rawName);
       const {splitExpr,matchAmount:ma}=parseNotes(notes);
@@ -2294,38 +2654,55 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         matchAmount: ma ?? amount, type,
         accountType: platformNames.bank,
         ref: String((cashMap as any).ref ? r[(cashMap as any).ref] : "").trim(),
-        date:fmtDate(cashMap.date?r[cashMap.date]:""), orig:r
+        date:fmtDate(cashMap.date?r[cashMap.date]:""), orig:r, _fileSessionId:cashFileSessionId
       };
     }).filter((r): r is CashierRow => r !== null);
 
     return rows;
-  },[cashRowsRaw,cashMap,cashSwap,platformNames.bank]);
+  },[cashRowsRaw,cashMap,cashSwap,platformNames.bank,cashFileSessionId]);
 
-  const parsedWalletCashier = useMemo(():CashierRow[] => walletCashRows.map((r,i) => {
+  const parsedWalletCashier = useMemo(():CashierRow[] => walletCashRows.map((r,i): CashierRow | null => {
     const rawName = String(walletCashMap.name ? r[walletCashMap.name] : "").trim();
     const { name, notes } = parseCashierName(rawName);
     const { splitExpr, matchAmount: ma } = parseNotes(notes);
     const { debit, credit, rawAmount, type } = resolveDebitCredit(r, walletCashMap.debit, walletCashMap.credit, walletCashSwap);
     const amount = rawAmount || ma || 0;
     if (!amount) return null;
-    return { id: 2000000 + i, rawName, name, notes, splitExpr, debit, credit, amount, matchAmount:ma ?? amount, type, accountType:platformNames.wallet, ref:String(walletCashMap.ref ? r[walletCashMap.ref] : "").trim(), date:fmtDate(walletCashMap.date ? r[walletCashMap.date] : ""), orig:r };
-  }).filter((r): r is CashierRow => r !== null), [walletCashRows, walletCashMap, walletCashSwap, platformNames.wallet]);
+    return { id: 2000000 + i, rawName, name, notes, splitExpr, debit, credit, amount, matchAmount:ma ?? amount, type, accountType:platformNames.wallet, ref:String(walletCashMap.ref ? r[walletCashMap.ref] : "").trim(), date:fmtDate(walletCashMap.date ? r[walletCashMap.date] : ""), orig:r, _fileSessionId:walletCashFileSessionId };
+  }).filter((r): r is CashierRow => r !== null), [walletCashRows, walletCashMap, walletCashSwap, platformNames.wallet, walletCashFileSessionId]);
 
-  const parseJawwalBankRows = useMemo(():BankRow[] => jawwalBankRows.map((r,i) => {
-    const { debit, credit, rawAmount, type } = resolveDebitCredit(r, jawwalBankMap.debit, jawwalBankMap.credit, jawwalBankSwap);
+  const parseJawwalBankRows = useMemo(():BankRow[] => jawwalBankRows.map((r,i): BankRow | null => {
+    const original = resolveDebitCredit(r, jawwalBankMap.debit, jawwalBankMap.credit, false);
+    const amountColumn = jawwalBankOptions.useTotalAmount ? jawwalBankMap.totalAmount : jawwalBankMap.movementAmount;
+    const useMappedAmount = !!amountColumn;
+    const amount = useMappedAmount ? Math.abs(toNum(r[amountColumn])) : original.rawAmount;
+    const direction = jawwalBankOptions.readDebitCredit && jawwalBankMap.direction
+      ? String(r[jawwalBankMap.direction] ?? "").trim().toLowerCase()
+      : "";
+    const isCredit = /دائن|credit/.test(direction);
+    const isDebit = /مدين|debit/.test(direction);
+    const type: BankRow["type"] = isCredit ? "مدفوع" : isDebit ? "مستلم" : original.type;
+    let debit = isDebit ? amount : isCredit ? 0 : useMappedAmount ? type === "مستلم" ? amount : 0 : original.debit;
+    let credit = isCredit ? amount : isDebit ? 0 : useMappedAmount ? type === "مدفوع" ? amount : 0 : original.credit;
+    let finalType = type;
+    if (jawwalBankSwap) {
+      [debit, credit] = [credit, debit];
+      finalType = type === "مدفوع" ? "مستلم" : "مدفوع";
+    }
+    const rawAmount = amount;
     if (!rawAmount) return null;
-    return { id: 4000000 + i, date:fmtDate(jawwalBankMap.date ? r[jawwalBankMap.date] : ""), description:String(jawwalBankMap.desc ? r[jawwalBankMap.desc] : "").trim(), debit, credit, rawAmount, type, accountType:platformNames.jawwal, ref:String(jawwalBankMap.ref ? r[jawwalBankMap.ref] : "").trim(), orig:r };
-  }).filter((r): r is BankRow => r !== null), [jawwalBankRows, jawwalBankMap, jawwalBankSwap, platformNames.jawwal]);
+    return { id: 4000000 + i, date:fmtDate(jawwalBankMap.date ? r[jawwalBankMap.date] : ""), description:String(jawwalBankMap.desc ? r[jawwalBankMap.desc] : "").trim(), debit, credit, rawAmount, type:finalType, accountType:platformNames.jawwal, ref:String(jawwalBankMap.ref ? r[jawwalBankMap.ref] : "").trim(), orig:r, _fileSessionId:jawwalBankFileSessionId };
+  }).filter((r): r is BankRow => r !== null), [jawwalBankRows, jawwalBankMap, jawwalBankSwap, jawwalBankOptions, jawwalBankFileSessionId, platformNames.jawwal]);
 
-  const parsedJawwalCashier = useMemo(():CashierRow[] => jawwalCashRows.map((r,i) => {
+  const parsedJawwalCashier = useMemo(():CashierRow[] => jawwalCashRows.map((r,i): CashierRow | null => {
     const rawName = String(jawwalCashMap.name ? r[jawwalCashMap.name] : "").trim();
     const { name, notes } = parseCashierName(rawName);
     const { splitExpr, matchAmount: ma } = parseNotes(notes);
     const { debit, credit, rawAmount, type } = resolveDebitCredit(r, jawwalCashMap.debit, jawwalCashMap.credit, jawwalCashSwap);
     const amount = rawAmount || ma || 0;
     if (!amount) return null;
-    return { id: 5000000 + i, rawName, name, notes, splitExpr, debit, credit, amount, matchAmount:ma ?? amount, type, accountType:platformNames.jawwal, ref:String(jawwalCashMap.ref ? r[jawwalCashMap.ref] : "").trim(), date:fmtDate(jawwalCashMap.date ? r[jawwalCashMap.date] : ""), orig:r };
-  }).filter((r): r is CashierRow => r !== null), [jawwalCashRows, jawwalCashMap, jawwalCashSwap, platformNames.jawwal]);
+    return { id: 5000000 + i, rawName, name, notes, splitExpr, debit, credit, amount, matchAmount:ma ?? amount, type, accountType:platformNames.jawwal, ref:String(jawwalCashMap.ref ? r[jawwalCashMap.ref] : "").trim(), date:fmtDate(jawwalCashMap.date ? r[jawwalCashMap.date] : ""), orig:r, _fileSessionId:jawwalCashFileSessionId };
+  }).filter((r): r is CashierRow => r !== null), [jawwalCashRows, jawwalCashMap, jawwalCashSwap, jawwalCashFileSessionId, platformNames.jawwal]);
 
   const parsedCustomRows = useMemo(() => {
     const bank: BankRow[] = [];
@@ -2354,6 +2731,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
               accountType: platform.name.trim() || `منصة مخصصة ${platform.id + 1}`,
               ref,
               orig: row,
+              _fileSessionId: source.fileSessionId,
             });
             return;
           }
@@ -2377,6 +2755,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
             ref,
             date,
             orig: row,
+            _fileSessionId: source.fileSessionId,
           });
         });
       }
@@ -2386,20 +2765,167 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
 
   const heldBankKeys = useMemo(() => new Set(heldItems.filter(h=>h.kind==="bank").map(h => `${h.fileSessionId}:${h.refId}`)), [heldItems]);
   const heldCashierKeys = useMemo(() => new Set(heldItems.filter(h=>h.kind==="cashier").map(h => `${h.fileSessionId}:${h.refId}`)), [heldItems]);
-
-  const activeBank = useMemo(
-    () => [...parsedBank.filter(b => !heldBankKeys.has(`${bankFileSessionId}:${b.id}`)), ...parseWalletBankRows, ...parseJawwalBankRows, ...parsedCustomRows.bank, ...returnedHeldBank],
-    [parsedBank, parseWalletBankRows, parseJawwalBankRows, parsedCustomRows, heldBankKeys, bankFileSessionId, returnedHeldBank]
+  const bankSourceRows = useMemo(
+    () => [...parsedBank, ...parseWalletBankRows, ...parseJawwalBankRows, ...parsedCustomRows.bank],
+    [parsedBank, parseWalletBankRows, parseJawwalBankRows, parsedCustomRows]
   );
-  const activeCashier = useMemo(
+  const cashierSourceRows = useMemo(
     () => [...stageAInvoices.map((invoice, index) => ({
       id: 3000000 + index, rawName: invoice.originalName, name: invoice.name, notes: invoice.issue, splitExpr: "",
       debit: invoice.amount, credit: 0, amount: invoice.amount, matchAmount: invoice.amount,
       type: "مدفوع" as const, accountType: invoice.source === "بال بي" ? platformNames.wallet : platformNames.bank,
-      ref: invoice.invoiceNumber, date: invoice.registrationTime, orig: invoice.invoice
-    })), ...parsedCashier.filter(c => !heldCashierKeys.has(`${cashFileSessionId}:${c.id}`)), ...parsedWalletCashier, ...parsedJawwalCashier, ...parsedCustomRows.cashier, ...returnedHeldCashier],
-    [stageAInvoices, parsedCashier, parsedWalletCashier, parsedJawwalCashier, parsedCustomRows, heldCashierKeys, cashFileSessionId, returnedHeldCashier, platformNames]
+      ref: invoice.invoiceNumber, date: invoice.registrationTime, orig: invoice.invoice, _fileSessionId: cashFileSessionId
+    })), ...parsedCashier, ...parsedWalletCashier, ...parsedJawwalCashier, ...parsedCustomRows.cashier],
+    [stageAInvoices, parsedCashier, parsedWalletCashier, parsedJawwalCashier, parsedCustomRows, cashFileSessionId, platformNames]
   );
+  const normalizedReturnedBank = useMemo(() => {
+    const usedSourceKeys = new Set<string>();
+    const normalized = returnedHeldBank.map((returned) => {
+      const sessionId = returned._fileSessionId ?? bankFileSessionId;
+      const source = bankSourceRows.find(row => {
+        const key = `${row._fileSessionId ?? bankFileSessionId}:${row.id}`;
+        if (usedSourceKeys.has(key) || (row._fileSessionId ?? bankFileSessionId) !== sessionId) return false;
+        return row.id === returned.id || (returned.id < 0 && sameBankMovement(row, returned));
+      });
+      if (!source) return { ...returned, _fileSessionId: sessionId, _fromHeld: true };
+      usedSourceKeys.add(`${source._fileSessionId ?? bankFileSessionId}:${source.id}`);
+      return { ...returned, id: source.id, _fileSessionId: sessionId, _fromHeld: true };
+    });
+    return normalized.filter((row, index) =>
+      normalized.findIndex(candidate =>
+        candidate.id === row.id && (candidate._fileSessionId ?? bankFileSessionId) === (row._fileSessionId ?? bankFileSessionId)
+      ) === index
+    );
+  }, [returnedHeldBank, bankSourceRows, bankFileSessionId]);
+  const normalizedReturnedCashier = useMemo(() => {
+    const usedSourceKeys = new Set<string>();
+    const normalized = returnedHeldCashier.map((returned) => {
+      const sessionId = returned._fileSessionId ?? cashFileSessionId;
+      const source = cashierSourceRows.find(row => {
+        const key = `${row._fileSessionId ?? cashFileSessionId}:${row.id}`;
+        if (usedSourceKeys.has(key) || (row._fileSessionId ?? cashFileSessionId) !== sessionId) return false;
+        return row.id === returned.id || (returned.id < 0 && sameCashierMovement(row, returned));
+      });
+      if (!source) return { ...returned, _fileSessionId: sessionId, _fromHeld: true };
+      usedSourceKeys.add(`${source._fileSessionId ?? cashFileSessionId}:${source.id}`);
+      return { ...returned, id: source.id, _fileSessionId: sessionId, _fromHeld: true };
+    });
+    return normalized.filter((row, index) =>
+      normalized.findIndex(candidate =>
+        candidate.id === row.id && (candidate._fileSessionId ?? cashFileSessionId) === (row._fileSessionId ?? cashFileSessionId)
+      ) === index
+    );
+  }, [returnedHeldCashier, cashierSourceRows, cashFileSessionId]);
+  const returnedBankKeys = useMemo(() => new Set(normalizedReturnedBank.map(row => `${row._fileSessionId ?? bankFileSessionId}:${row.id}`)), [normalizedReturnedBank, bankFileSessionId]);
+  const returnedCashierKeys = useMemo(() => new Set(normalizedReturnedCashier.map(row => `${row._fileSessionId ?? cashFileSessionId}:${row.id}`)), [normalizedReturnedCashier, cashFileSessionId]);
+  const activeBank = useMemo(
+    () => bankSourceRows
+      .filter(row => {
+        const key = `${row._fileSessionId ?? bankFileSessionId}:${row.id}`;
+        return !heldBankKeys.has(key) && !returnedBankKeys.has(key);
+      })
+      .concat(normalizedReturnedBank.filter(row => !heldBankKeys.has(`${row._fileSessionId ?? bankFileSessionId}:${row.id}`))),
+    [bankSourceRows, heldBankKeys, returnedBankKeys, bankFileSessionId, normalizedReturnedBank]
+  );
+  const activeCashier = useMemo(
+    () => cashierSourceRows
+      .filter(row => {
+        const key = `${row._fileSessionId ?? cashFileSessionId}:${row.id}`;
+        return !heldCashierKeys.has(key) && !returnedCashierKeys.has(key);
+      })
+      .concat(normalizedReturnedCashier.filter(row => !heldCashierKeys.has(`${row._fileSessionId ?? cashFileSessionId}:${row.id}`))),
+    [cashierSourceRows, heldCashierKeys, returnedCashierKeys, cashFileSessionId, normalizedReturnedCashier]
+  );
+  const nonReconciliationBankRows = useMemo(
+    () => activeBank.flatMap((bank) => {
+      const reason = getNonReconciliationBankReason(bank);
+      return reason ? [{ bank, reason }] : [];
+    }),
+    [activeBank]
+  );
+  const nonReconciliationBankKeys = useMemo(
+    () => new Set(nonReconciliationBankRows.map(({ bank }) => `${bank._fileSessionId ?? bankFileSessionId}:${bank.id}`)),
+    [nonReconciliationBankRows, bankFileSessionId]
+  );
+  const matchableBank = useMemo(
+    () => activeBank.filter((bank) => !nonReconciliationBankKeys.has(`${bank._fileSessionId ?? bankFileSessionId}:${bank.id}`)),
+    [activeBank, nonReconciliationBankKeys, bankFileSessionId]
+  );
+  const splitAdjustedBank = useMemo(() => {
+    const reportRows: BankRow[] = [];
+    const matchingRows: BankRow[] = [];
+    for (const bank of matchableBank) {
+      const split = bankSplits.find(entry => entry.bankId === bank.id && entry.bankSessionId === (bank._fileSessionId ?? 0));
+      if (!split) {
+        reportRows.push(bank);
+        matchingRows.push(bank);
+        continue;
+      }
+      bankSplitAllocationGroups(split).forEach((allocations, cashierKey) => {
+        const amount = allocations.reduce((sum, allocation) => sum + allocation.amount, 0);
+        const row: BankRow = {
+          ...bank,
+          id: bankSplitVirtualId(split, cashierKey, allocations),
+          description: bank.description,
+          rawAmount: amount,
+          debit: bank.type === "مستلم" ? amount : 0,
+          credit: bank.type === "مدفوع" ? amount : 0,
+          orig: {
+            ...bank.orig,
+            _splitId: split.id,
+            _splitPart: allocations.map(allocation => split.allocations.indexOf(allocation) + 1).join(", "),
+            _splitNote: allocations.map(allocation => allocation.note).filter(Boolean).join(" · "),
+          },
+        };
+        reportRows.push(row);
+        matchingRows.push(row);
+      });
+    }
+    return { reportRows, matchingRows };
+  }, [matchableBank, bankSplits]);
+
+  const clearedCashierKeys = useMemo(() => new Set(clearingGroups.flatMap(group =>
+    [...group.debitRows, ...group.creditRows].map(reference => `${reference.sessionId}:${reference.id}`)
+  )), [clearingGroups]);
+  const cutoffAdjustedCashier = useMemo(() => {
+    const replacedKeys = new Set<string>();
+    const syntheticRows: CashierRow[] = [];
+    for (const batch of cutoffBatches) {
+      const target = activeCashier.find(row =>
+        row.id === batch.aggregateId && (row._fileSessionId ?? 0) === batch.aggregateSessionId
+      );
+      const sourceRows = batch.sourceRows.map(reference => activeCashier.find(row =>
+        row.id === reference.id && (row._fileSessionId ?? 0) === reference.sessionId
+      ));
+      if (!target || sourceRows.some(row => !row)) continue;
+      replacedKeys.add(transactionKey(target));
+      sourceRows.forEach(row => { if (row) replacedKeys.add(transactionKey(row)); });
+      const selectedRows = sourceRows.filter((row): row is CashierRow => row !== undefined);
+      const label = `${target.name} · مجموعة تعطل الكاشير ${batch.dateFrom} إلى ${batch.dateTo}`;
+      syntheticRows.push({
+        ...target,
+        id: batch.syntheticId,
+        rawName: label,
+        name: label,
+        notes: batch.note,
+        amount: batch.total,
+        matchAmount: batch.total,
+        debit: selectedRows.reduce((sum, row) => sum + row.debit, 0),
+        credit: selectedRows.reduce((sum, row) => sum + row.credit, 0),
+        date: `${batch.dateFrom} — ${batch.dateTo}`,
+        orig: { _cutoffBatchId: batch.id, sourceCount: selectedRows.length },
+      });
+    }
+    const openRows = activeCashier.filter(row => !clearedCashierKeys.has(transactionKey(row)));
+    return {
+      reportRows: openRows.filter(row => !replacedKeys.has(transactionKey(row))).concat(syntheticRows),
+      matchingRows: openRows.filter(row => !replacedKeys.has(transactionKey(row))).concat(syntheticRows),
+    };
+  }, [activeCashier, cutoffBatches, clearedCashierKeys]);
+  const reconciliationBankRows = splitAdjustedBank.matchingRows;
+  const reconciliationCashierRows = cutoffAdjustedCashier.matchingRows;
+  const reportBankRows = splitAdjustedBank.reportRows;
+  const reportCashierRows = cutoffAdjustedCashier.reportRows;
 
   const savedKeys = useMemo(() => new Set(savedMatches.map(s => `${s.cashierId}-${s.bankId}`)), [savedMatches]);
   const savedCashierIds = useMemo(() => new Set(savedMatches.map(s => s.cashierId)), [savedMatches]);
@@ -2471,15 +2997,19 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   }, [uCashierRows, unmatchedBankForSuggestions, rejectedPairs, savedKeys, claimedNames, nameAliases]);
 
   const rerun = useCallback(() => {
-    if (!activeBank.length || !activeCashier.length) return;
-    const res = reconcile(activeBank, activeCashier, manualGroups, savedMatches, rejectedPairs, visaCashierIds, jawwalPayCashierIds, mahmoudWalletCashierIds, amountTolerancePercent, nameAliases);
+    if (!reconciliationBankRows.length || !reconciliationCashierRows.length) return;
+    const res = reconcile(reconciliationBankRows, reconciliationCashierRows, manualGroups, savedMatches, rejectedPairs, visaCashierIds, jawwalPayCashierIds, mahmoudWalletCashierIds, amountTolerancePercent, nameAliases);
     setResults(res);
-  }, [activeBank, activeCashier, manualGroups, savedMatches, rejectedPairs, visaCashierIds, jawwalPayCashierIds, mahmoudWalletCashierIds, amountTolerancePercent, nameAliases]);
+  }, [reconciliationBankRows, reconciliationCashierRows, manualGroups, savedMatches, rejectedPairs, visaCashierIds, jawwalPayCashierIds, mahmoudWalletCashierIds, amountTolerancePercent, nameAliases]);
 
   const run = async() => {
     setLoading(true); setError(null);
     try {
-      const res = reconcile(activeBank, activeCashier, manualGroups, savedMatches, rejectedPairs, visaCashierIds, jawwalPayCashierIds, mahmoudWalletCashierIds, amountTolerancePercent, nameAliases);
+      if (!reconciliationBankRows.length) {
+        setError("كل حركات البنك مصنّفة كمعلّقات غير تابعة للمطابقة.");
+        return;
+      }
+      const res = reconcile(reconciliationBankRows, reconciliationCashierRows, manualGroups, savedMatches, rejectedPairs, visaCashierIds, jawwalPayCashierIds, mahmoudWalletCashierIds, amountTolerancePercent, nameAliases);
       setResults(res);
       setTab("saved");
       setToast(`تمت مطابقة ${res.filter(r => r.type === "pending" || r.type === "saved").length} سجل`);
@@ -2760,7 +3290,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
 
   const drawerBanks = useMemo(() => {
     if (drawerMode !== "bank" || !drawerCashier) return [];
-    return activeBank
+    return reconciliationBankRows
       .filter(b => {
         if (b.type !== drawerCashier.type) return false;
         const pairKey = `${drawerCashier.id}-${b.id}`;
@@ -2780,11 +3310,11 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         return nameSim(drawerCashier.name, b.description) - nameSim(drawerCashier.name, a.description);
       })
       .slice(0, 50);
-  }, [drawerMode, drawerCashier, drawerNameSearch, drawerAmountFrom, drawerAmountTo, activeBank, savedBankIds, savedKeys, drawerOldBank]);
+  }, [drawerMode, drawerCashier, drawerNameSearch, drawerAmountFrom, drawerAmountTo, reconciliationBankRows, savedBankIds, savedKeys, drawerOldBank]);
 
   const drawerCashiers = useMemo(() => {
     if (drawerMode !== "cashier" || !drawerOldBank) return [];
-    return activeCashier
+    return reconciliationCashierRows
       .filter(c => {
         if (c.type !== drawerOldBank.type) return false;
         if (visaCashierIds.has(c.id)) return false;
@@ -2805,7 +3335,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         return nameSim(drawerOldBank.description, b.name) - nameSim(drawerOldBank.description, a.name);
       })
       .slice(0, 50);
-  }, [drawerMode, drawerOldBank, drawerCashier, drawerNameSearch, drawerAmountFrom, drawerAmountTo, activeCashier, savedCashierIds, savedKeys, visaCashierIds]);
+  }, [drawerMode, drawerOldBank, drawerCashier, drawerNameSearch, drawerAmountFrom, drawerAmountTo, reconciliationCashierRows, savedCashierIds, savedKeys, visaCashierIds]);
 
   const openDrawer = (cashier: CashierRow, oldBank: BankRow, mode: "bank" | "cashier" = "bank") => {
     setDrawerMode(mode);
@@ -2840,7 +3370,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   }, [drawerOpen]);
 
   const handleDropBank = (cashier: CashierRow, oldBank: BankRow, newBankId: number) => {
-    const newBank = activeBank.find(b => b.id === newBankId);
+    const newBank = reconciliationBankRows.find(b => b.id === newBankId);
     if (!newBank) return;
     handleReplaceBank(cashier, oldBank, newBank);
   };
@@ -2856,7 +3386,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   };
 
   const handleDropCashier = (bankRow: BankRow, oldCashier: CashierRow, newCashierId: number) => {
-    const newCashier = activeCashier.find(c => c.id === newCashierId);
+    const newCashier = reconciliationCashierRows.find(c => c.id === newCashierId);
     if (!newCashier) return;
     handleReplaceCashier(bankRow, oldCashier, newCashier);
   };
@@ -2918,46 +3448,53 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   };
 
   const handleHoldCashier = (c: CashierRow, note?: string) => {
-    if (heldItems.some(h => h.kind === "cashier" && h.refId === c.id && h.fileSessionId === cashFileSessionId)) {
+    const fileSessionId = c._fileSessionId ?? cashFileSessionId;
+    if (heldItems.some(h => h.kind === "cashier" && h.refId === c.id && h.fileSessionId === fileSessionId)) {
       setToast("هذه الفاتورة موجودة بالفعل في المعلقات.");
       return;
     }
     if ((c as any)._fromHeld) {
-      setReturnedHeldCashier(prev => prev.filter(x => x.id !== c.id));
+      setReturnedHeldCashier(prev => prev.filter(x =>
+        (x._fileSessionId ?? cashFileSessionId) !== fileSessionId ||
+        (x.id !== c.id && !sameCashierMovement(x, c))
+      ));
     }
     const item: HeldItem = {
       id: `held-c-${Date.now()}-${c.id}`, kind: "cashier", refId: c.id,
-      fileSessionId: cashFileSessionId, data: c,
+      fileSessionId, data: c,
       heldAt: new Date().toLocaleString("ar-SA"), note
     };
-    setHeldItems(prev => [...prev, item]);
+    setHeldItems(prev => dedupeHeldItems([...prev, item]));
     setExpandedMatchKey(null);
     setExpandedUnmatchedCashier(null);
   };
   const handleHoldBank = (b: BankRow, note?: string) => {
-    if (heldItems.some(h => h.kind === "bank" && h.refId === b.id && h.fileSessionId === bankFileSessionId)) {
+    const fileSessionId = b._fileSessionId ?? bankFileSessionId;
+    if (heldItems.some(h => h.kind === "bank" && h.refId === b.id && h.fileSessionId === fileSessionId)) {
       setToast("هذه الحوالة موجودة بالفعل في المعلقات.");
       return;
     }
     if ((b as any)._fromHeld) {
-      setReturnedHeldBank(prev => prev.filter(x => x.id !== b.id));
+      setReturnedHeldBank(prev => prev.filter(x =>
+        (x._fileSessionId ?? bankFileSessionId) !== fileSessionId ||
+        (x.id !== b.id && !sameBankMovement(x, b))
+      ));
     }
     const item: HeldItem = {
       id: `held-b-${Date.now()}-${b.id}`, kind: "bank", refId: b.id,
-      fileSessionId: bankFileSessionId, data: b,
+      fileSessionId, data: b,
       heldAt: new Date().toLocaleString("ar-SA"), note
     };
-    setHeldItems(prev => [...prev, item]);
+    setHeldItems(prev => dedupeHeldItems([...prev, item]));
     setExpandedMatchKey(null);
   };
   const handleUnhold = (h: HeldItem) => {
-    const uniqueId = nextHeldRowId();
     if (h.kind === "bank") {
-      const row: BankRow = { ...(h.data as BankRow), id: uniqueId, _fromHeld: true };
-      setReturnedHeldBank(prev => [...prev, row]);
+      const row: BankRow = { ...(h.data as BankRow), _fileSessionId: h.fileSessionId, _fromHeld: true };
+      setReturnedHeldBank(prev => prev.some(item => item.id === row.id && item._fileSessionId === row._fileSessionId) ? prev : [...prev, row]);
     } else {
-      const row: CashierRow = { ...(h.data as CashierRow), id: uniqueId, _fromHeld: true };
-      setReturnedHeldCashier(prev => [...prev, row]);
+      const row: CashierRow = { ...(h.data as CashierRow), _fileSessionId: h.fileSessionId, _fromHeld: true };
+      setReturnedHeldCashier(prev => prev.some(item => item.id === row.id && item._fileSessionId === row._fileSessionId) ? prev : [...prev, row]);
     }
     setHeldItems(prev => prev.filter(x => x.id !== h.id));
   };
@@ -2965,17 +3502,197 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     if (!window.confirm("حذف هذا العنصر نهائياً من المعلقات؟")) return;
     setHeldItems(prev => prev.filter(h => h.id !== id));
   };
+  const handleSaveBankSplit = (split: BankSplit): boolean => {
+    const bank = matchableBank.find(row => transactionKey(row) === `${split.bankSessionId}:${split.bankId}`);
+    if (!bank || savedBankIds.has(bank.id)) {
+      setToast("تعذّر حفظ التجزئة: الحوالة لم تعد متاحة. حدّث الأداة وحاول مجدداً.");
+      return false;
+    }
+    const allocationTotal = split.allocations.reduce((sum, allocation) => sum + allocation.amount, 0);
+    if (!split.allocations.length || Math.abs(allocationTotal - bank.rawAmount) > 0.01) {
+      setToast("تعذّر حفظ التجزئة: مجموع الحصص لا يساوي قيمة الحوالة الأصلية.");
+      return false;
+    }
+    const linkedMatches: SavedMatch[] = [];
+    const allocatedByCashier = new Map<string, { row: CashierRow; total: number; allocations: SplitAllocation[] }>();
+    for (const allocation of split.allocations) {
+      if (allocation.amount <= 0 || (allocation.kind === "external" && !allocation.note.trim())) {
+        setToast("تعذّر حفظ التجزئة: كل حصة يجب أن تكون موجبة والحصص الخارجية تحتاج إلى توضيح.");
+        return false;
+      }
+      if (allocation.kind !== "company" || allocation.cashierId == null) continue;
+      const cashier = activeCashier.find(row =>
+        row.id === allocation.cashierId && (row._fileSessionId ?? 0) === (allocation.cashierSessionId ?? 0)
+      );
+      if (!cashier || savedCashierIds.has(cashier.id) || cashier.type !== bank.type) {
+        setToast("تعذّر حفظ التجزئة: إحدى الفواتير لم تعد متاحة أو تغيّرت قيمتها.");
+        return false;
+      }
+      const cashierKey = transactionKey(cashier);
+      const allocated: { row: CashierRow; total: number; allocations: SplitAllocation[] } =
+        allocatedByCashier.get(cashierKey) ?? { row: cashier, total: 0, allocations: [] };
+      allocated.total += allocation.amount;
+      allocated.allocations.push(allocation);
+      allocatedByCashier.set(cashierKey, allocated);
+    }
+    for (const [cashierKey, { row, total, allocations }] of allocatedByCashier) {
+      if (Math.abs(row.matchAmount - total) > 0.01) {
+        setToast(`تعذّر حفظ التجزئة: مجموع الحصص المخصصة إلى «${row.name}» لا يساوي مبلغ السند.`);
+        return false;
+      }
+      const virtualBankId = bankSplitVirtualId(split, cashierKey, allocations);
+      if (savedMatches.some(match => match.cashierId === row.id && match.bankId === virtualBankId)) {
+        setToast("إحدى حصص هذه التجزئة مرتبطة بمطابقة سابقة؛ لم يتم حفظ التغيير.");
+        return false;
+      }
+      linkedMatches.push({
+        id: `split-match-${split.id}-${cashierKey.replace(":", "-")}`,
+        cashierId: row.id,
+        bankId: virtualBankId,
+        cashierName: row.name,
+        bankDesc: bank.description,
+        amount: total,
+        type: row.type,
+        date: new Date().toLocaleDateString("ar-SA"),
+        savedAt: new Date().toLocaleString("ar-SA"),
+        note: allocations.map(allocation => allocation.note).filter(Boolean).join(" · ") || "حصة من حوالة مجزأة",
+        isAmountDiff: false,
+        isNameDiff: true,
+        isManual: true,
+        isAccountTypeDiff: accountTypesDiffer(bank.accountType, row.accountType),
+        bankAccountType: bank.accountType,
+        cashierAccountType: row.accountType,
+        editorNotes: `تجزئة حوالة ${split.description} · الحصص ${allocations.map(allocation => split.allocations.indexOf(allocation) + 1).join(", ")}`,
+      });
+    }
+    if (!linkedMatches.length) {
+      setToast("يجب ربط حصة واحدة على الأقل بفاتورة تخص شركتكم.");
+      return false;
+    }
+    setBankSplits(previous => [...previous, split]);
+    setSavedMatches(previous => [...previous, ...linkedMatches]);
+    setResults(null);
+    setToast(`تم حفظ التجزئة وربط ${linkedMatches.length} سنداً بالفواتير.`);
+    return true;
+  };
+  const handleDeleteBankSplit = (split: BankSplit) => {
+    const childIds = new Set(Array.from(bankSplitAllocationGroups(split), ( [key, allocations]) => bankSplitVirtualId(split, key, allocations)));
+    const linked = savedMatches.filter(match => childIds.has(match.bankId));
+    if (!window.confirm(linked.length
+      ? `إلغاء هذه التجزئة وإزالة ${linked.length} مطابقة مرتبطة بها؟`
+      : "إلغاء هذه التجزئة وإعادة الحوالة الأصلية إلى قائمة المطابقة؟")) return;
+    setSavedMatches(previous => previous.filter(match => !childIds.has(match.bankId)));
+    setManualGroups(previous => previous.filter(group => !group.banks.some(bank => childIds.has(bank.id))));
+    setBankSplits(previous => previous.filter(item => item.id !== split.id));
+    setResults(null);
+    setToast("تم إلغاء التجزئة وإعادة الحوالة الأصلية.");
+  };
+  const handleSaveCutoffBatch = (batch: CutoffBatch): boolean => {
+    const unavailable = new Set([
+      ...savedCashierIds,
+      ...heldItems.filter(item => item.kind === "cashier").map(item => item.refId),
+    ]);
+    const target = activeCashier.find(row =>
+      row.id === batch.aggregateId && (row._fileSessionId ?? 0) === batch.aggregateSessionId
+    );
+    const sources = batch.sourceRows.map(reference => activeCashier.find(row =>
+      row.id === reference.id && (row._fileSessionId ?? 0) === reference.sessionId
+    ));
+    if (!target || sources.some(row => !row) ||
+        unavailable.has(target.id) ||
+        sources.some(row => row && (unavailable.has(row.id) || row.type !== target.type)) ||
+        sources.some((row): row is CashierRow => !!row && cutoffBatches.some(existing =>
+          existing.sourceRows.some(reference => reference.id === row.id && reference.sessionId === (row._fileSessionId ?? 0))
+        ))) {
+      setToast("تعذّر حفظ المجموعة: تغيّرت إحدى الحركات أو لم تعد متاحة للمطابقة.");
+      return false;
+    }
+    const total = sources.reduce((sum, row) => sum + (row?.matchAmount ?? 0), 0);
+    if (Math.abs(total - target.matchAmount) > 0.01 || Math.abs(total - batch.total) > 0.01) {
+      setToast("تعذّر حفظ المجموعة: مجموع الفواتير لم يعد مساوياً لسند الإجمالي.");
+      return false;
+    }
+    setCutoffBatches(previous => [...previous, batch]);
+    setResults(null);
+    setToast(`تم إنشاء مجموعة فترة التعطل من ${sources.length} فاتورة بمبلغ ${fmtNum(total)}.`);
+    return true;
+  };
+  const handleDeleteCutoffBatch = (batch: CutoffBatch) => {
+    const linked = savedMatches.filter(match => match.cashierId === batch.syntheticId);
+    if (!window.confirm(linked.length
+      ? `إلغاء المجموعة وإزالة ${linked.length} مطابقة مرتبطة بها؟`
+      : "إلغاء المجموعة وإعادة الحركات الأصلية إلى المطابقة؟")) return;
+    setSavedMatches(previous => previous.filter(match => match.cashierId !== batch.syntheticId));
+    setManualGroups(previous => previous.filter(group => !group.cashiers.some(row => row.id === batch.syntheticId)));
+    setCutoffBatches(previous => previous.filter(item => item.id !== batch.id));
+    setResults(null);
+    setToast("تم إلغاء مجموعة فترة التعطل.");
+  };
+  const handleSaveClearingGroup = (group: ClearingGroup): boolean => {
+    const allRefs = [...group.debitRows, ...group.creditRows];
+    const selectedKeys = allRefs.map(reference => `${reference.sessionId}:${reference.id}`);
+    const uniqueKeys = new Set(selectedKeys);
+    const rows = allRefs.map(reference => activeCashier.find(row =>
+      row.id === reference.id && (row._fileSessionId ?? 0) === reference.sessionId
+    ));
+    const unavailableKeys = new Set<string>([
+      ...activeCashier.filter(row => savedCashierIds.has(row.id)).map(transactionKey),
+      ...heldItems.filter(item => item.kind === "cashier").map(item => `${item.fileSessionId}:${item.refId}`),
+      ...manualGroups.flatMap(group => group.cashiers.map(transactionKey)),
+      ...cutoffBatches.flatMap(batch => [
+        `${batch.aggregateSessionId}:${batch.aggregateId}`,
+        ...batch.sourceRows.map(reference => `${reference.sessionId}:${reference.id}`),
+      ]),
+      ...bankSplits.flatMap(split => split.allocations
+        .filter(allocation => allocation.kind === "company" && allocation.cashierId != null)
+        .map(allocation => `${allocation.cashierSessionId ?? 0}:${allocation.cashierId}`)),
+      ...clearedCashierKeys,
+    ]);
+    if (allRefs.length < 2 || uniqueKeys.size !== allRefs.length || rows.some(row => !row) ||
+        selectedKeys.some(key => unavailableKeys.has(key))) {
+      setToast("تعذّر التسكير: إحدى الحركات مكررة أو لم تعد متاحة.");
+      return false;
+    }
+    const resolved = rows as CashierRow[];
+    const debitRows = resolved.slice(0, group.debitRows.length);
+    const creditRows = resolved.slice(group.debitRows.length);
+    if (new Set(resolved.map(row => row.accountType.trim()).filter(Boolean)).size > 1) {
+      setToast("تعذّر التسكير: لا يمكن جمع حركات من حسابات أو منصات مختلفة.");
+      return false;
+    }
+    if (debitRows.some(row => row.debit <= 0 || row.credit > 0) ||
+        creditRows.some(row => row.credit <= 0 || row.debit > 0)) {
+      setToast("تعذّر التسكير: تأكد أن الطرف الأول مدين بالكامل والثاني دائن بالكامل.");
+      return false;
+    }
+    const debitTotal = debitRows.reduce((sum, row) => sum + row.debit, 0);
+    const creditTotal = creditRows.reduce((sum, row) => sum + row.credit, 0);
+    if (Math.abs(debitTotal - creditTotal) > 0.01 || Math.abs(debitTotal - group.total) > 0.01) {
+      setToast("تعذّر التسكير: مجموع المدين لا يساوي مجموع الدائن.");
+      return false;
+    }
+    setClearingGroups(previous => [...previous, group]);
+    setResults(null);
+    setToast(`تم تسكير ${debitRows.length + creditRows.length} حركة بمبلغ ${fmtNum(debitTotal)}.`);
+    return true;
+  };
+  const handleDeleteClearingGroup = (group: ClearingGroup) => {
+    if (!window.confirm("إلغاء التسكير وإعادة الحركات إلى قائمة المراجعة؟")) return;
+    setClearingGroups(previous => previous.filter(item => item.id !== group.id));
+    setResults(null);
+    setToast("تم إلغاء التسكير وإعادة الحركات المفتوحة.");
+  };
 
   useEffect(() => {
     if (skipNextAutoReconcile.current) {
       skipNextAutoReconcile.current = false;
       return;
     }
-    if (activeBank.length && activeCashier.length) {
+    if (reconciliationBankRows.length && reconciliationCashierRows.length) {
       rerun();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [manualGroups, savedMatches, rejectedPairs, visaItems, jawwalPayCashierIds, mahmoudWalletCashierIds, rejectedSpecialCashierIds, heldItems, activeBank, activeCashier, amountTolerancePercent]);
+  }, [manualGroups, savedMatches, rejectedPairs, visaItems, jawwalPayCashierIds, mahmoudWalletCashierIds, rejectedSpecialCashierIds, heldItems, bankSplits, cutoffBatches, clearingGroups, reconciliationBankRows, reconciliationCashierRows, amountTolerancePercent]);
 
   const stats = useMemo(() => {
     if (!results) return null;
@@ -2987,10 +3704,11 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       jawwalPay: results.filter(r => r.type === "jawwalPay").length,
       mahmoudWallet: results.filter(r => r.type === "mahmoudWallet").length,
       held: heldItems.length,
+      nonReconciliationBank: nonReconciliationBankRows.length,
       uCashier: results.filter(r => r.type === "unmatchedCashier").length,
       uBank: results.filter(r => r.type === "unmatchedBank").length,
     };
-  }, [results, visaItems, heldItems]);
+  }, [results, visaItems, heldItems, nonReconciliationBankRows]);
 
   const canRun = bankRowsRaw.length > 0 && cashRowsRaw.length > 0 && bankMap.desc && cashMap.name && (cashMap.debit || cashMap.credit);
 
@@ -3013,6 +3731,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   }, [visiblePendingRows, pendingPage]);
   const visibleUCashierRows = uCashierRows.filter(filterResult);
   const visibleUBankRows = uBankRows.filter(filterResult);
+  const visibleNonReconciliationBankRows = nonReconciliationBankRows.filter(({ bank }) => filterResult({ bank }));
 
   useEffect(() => {
     if (!toast) return;
@@ -3030,8 +3749,20 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       bankHeaders, bankRowsRaw, bankMap, bankSwap, bankFileSessionId,
       cashHeaders, cashRowsRaw, cashMap, cashSwap, cashFileSessionId,
       manualGroups, savedMatches,
+      bankSplits, cutoffBatches, clearingGroups,
+      nameAliases,
+      rejectedSpecialCashierIds: Array.from(rejectedSpecialCashierIds),
+      amountTolerancePercent,
+      bankFileSnapshots, cashFileSnapshots, walletBankFileSnapshots, walletCashFileSnapshots,
+      jawwalBankFileSnapshots, jawwalCashFileSnapshots,
+      stageAInvoices,
+      walletBankHeaders, walletBankRows, walletBankMap, walletBankSwap, walletBankFileSessionId,
+      walletCashHeaders, walletCashRows, walletCashMap, walletCashSwap, walletCashFileSessionId,
+      jawwalBankHeaders, jawwalBankRows, jawwalBankMap, jawwalBankSwap, jawwalBankOptions, jawwalBankFileSessionId,
+      jawwalCashHeaders, jawwalCashRows, jawwalCashMap, jawwalCashSwap, jawwalCashFileSessionId,
+      platformNames, customPlatforms,
       rejectedPairs: Array.from(rejectedPairs),
-      visaItems, heldItems, returnedHeldBank, returnedHeldCashier, platformNames, customPlatforms
+      visaItems, heldItems, returnedHeldBank, returnedHeldCashier
     };
     await persistProjectsList([...projects, project]);
     setToast(`تم حفظ المشروع "${name}" ✓`);
@@ -3042,15 +3773,47 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     setBankFileSessionId(p.bankFileSessionId ?? 0);
     setCashH(p.cashHeaders); setCashRows(p.cashRowsRaw); setCashMap({ date: p.cashMap?.date ?? "", name: p.cashMap?.name ?? "", debit: p.cashMap?.debit ?? "", credit: p.cashMap?.credit ?? "", accountType: p.cashMap?.accountType ?? "", ref: (p.cashMap as any)?.ref ?? "" }); setCashSwap(p.cashSwap ?? false);
     setCashFileSessionId(p.cashFileSessionId ?? 0);
+    setStageAInvoices(p.stageAInvoices ?? []);
+    setWalletBankHeaders(p.walletBankHeaders ?? []); setWalletBankRows(p.walletBankRows ?? []);
+    setWalletBankMap({ date: p.walletBankMap?.date ?? "", desc: p.walletBankMap?.desc ?? "", debit: p.walletBankMap?.debit ?? "", credit: p.walletBankMap?.credit ?? "", ref: p.walletBankMap?.ref ?? "" });
+    setWalletBankSwap(p.walletBankSwap ?? false); setWalletBankFileSessionId(p.walletBankFileSessionId ?? 0);
+    setWalletCashHeaders(p.walletCashHeaders ?? []); setWalletCashRows(p.walletCashRows ?? []);
+    setWalletCashMap({ date: p.walletCashMap?.date ?? "", name: p.walletCashMap?.name ?? "", debit: p.walletCashMap?.debit ?? "", credit: p.walletCashMap?.credit ?? "", ref: p.walletCashMap?.ref ?? "" });
+    setWalletCashSwap(p.walletCashSwap ?? false); setWalletCashFileSessionId(p.walletCashFileSessionId ?? 0);
+    setJawwalBankHeaders(p.jawwalBankHeaders ?? []); setJawwalBankRows(p.jawwalBankRows ?? []);
+    setJawwalBankMap({ date: p.jawwalBankMap?.date ?? "", desc: p.jawwalBankMap?.desc ?? "", debit: p.jawwalBankMap?.debit ?? "", credit: p.jawwalBankMap?.credit ?? "", ref: p.jawwalBankMap?.ref ?? "", totalAmount: p.jawwalBankMap?.totalAmount ?? "", movementAmount: p.jawwalBankMap?.movementAmount ?? "", direction: p.jawwalBankMap?.direction ?? "" });
+    setJawwalBankSwap(p.jawwalBankSwap ?? false); setJawwalBankOptions({ useTotalAmount: true, readDebitCredit: true, ...(p.jawwalBankOptions ?? {}) });
+    setJawwalBankFileSessionId(p.jawwalBankFileSessionId ?? 0);
+    setJawwalCashHeaders(p.jawwalCashHeaders ?? []); setJawwalCashRows(p.jawwalCashRows ?? []);
+    setJawwalCashMap({ date: p.jawwalCashMap?.date ?? "", name: p.jawwalCashMap?.name ?? "", debit: p.jawwalCashMap?.debit ?? "", credit: p.jawwalCashMap?.credit ?? "", ref: p.jawwalCashMap?.ref ?? "" });
+    setJawwalCashSwap(p.jawwalCashSwap ?? false); setJawwalCashFileSessionId(p.jawwalCashFileSessionId ?? 0);
     setManualGroups(p.manualGroups); setSavedMatches(p.savedMatches);
+    setBankSplits(p.bankSplits ?? []);
+    setCutoffBatches(p.cutoffBatches ?? []);
+    setClearingGroups(p.clearingGroups ?? []);
+    setNameAliases(p.nameAliases ?? {});
+    setRejectedSpecialCashierIds(normalizeIdSet(p.rejectedSpecialCashierIds));
+    setAmountTolerancePercent(Math.min(10, Math.max(0, p.amountTolerancePercent ?? 0.5)));
+    setBankFileSnapshots(p.bankFileSnapshots ?? []);
+    setCashFileSnapshots(p.cashFileSnapshots ?? []);
+    setWalletBankFileSnapshots(p.walletBankFileSnapshots ?? []);
+    setWalletCashFileSnapshots(p.walletCashFileSnapshots ?? []);
+    setJawwalBankFileSnapshots(p.jawwalBankFileSnapshots ?? []);
+    setJawwalCashFileSnapshots(p.jawwalCashFileSnapshots ?? []);
     setRejected(new Set(p.rejectedPairs));
     setVisaItems(p.visaItems ?? []);
-    setHeldItems(p.heldItems ?? []);
+    setHeldItems(dedupeHeldItems(p.heldItems ?? []));
     setReturnedHeldBank((p as any).returnedHeldBank ?? []);
     setReturnedHeldCashier((p as any).returnedHeldCashier ?? []);
     setPlatformNames({ bank: "بنك فلسطين", wallet: "بال بي", jawwal: "جوال بي", ...(p.platformNames ?? {}) });
     setCustomPlatforms(p.customPlatforms ?? []);
     nextCustomPlatformId.current = Math.max(0, ...(p.customPlatforms ?? []).map(platform => platform.id + 1));
+    nextCustomSourceSessionId.current = Math.max(1, ...(p.customPlatforms ?? []).flatMap(platform => [platform.transfer?.fileSessionId ?? 0, platform.invoice?.fileSessionId ?? 0]).map(id => id + 1));
+    setWalletBankFileSessionId(p.walletBankFileSessionId ?? 0);
+    setWalletCashFileSessionId(p.walletCashFileSessionId ?? 0);
+    setJawwalBankFileSessionId(p.jawwalBankFileSessionId ?? 0);
+    setJawwalCashFileSessionId(p.jawwalCashFileSessionId ?? 0);
+    setJawwalBankOptions({ useTotalAmount: true, readDebitCredit: true, ...(p.jawwalBankOptions ?? {}) });
     setBankFile(null); setCashFile(null);
     setResults(null);
   };
@@ -3077,13 +3840,15 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     setCashH([]); setCashRows([]); setCashMap({date:"",name:"",debit:"",credit:"",accountType:"",ref:""}); setCashSwap(false); setCashFile(null); setCashFileSessionId(0); setStageAInvoices([]);
     setWalletBankFile(null); setWalletBankHeaders([]); setWalletBankRows([]); setWalletBankMap({date:"",desc:"",debit:"",credit:"",ref:""}); setWalletBankSwap(false);
     setWalletCashFile(null); setWalletCashHeaders([]); setWalletCashRows([]); setWalletCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setWalletCashSwap(false);
-    setJawwalBankFile(null); setJawwalBankHeaders([]); setJawwalBankRows([]); setJawwalBankMap({date:"",desc:"",debit:"",credit:"",ref:""}); setJawwalBankSwap(false);
+    setWalletBankFileSessionId(id => id + 1); setWalletCashFileSessionId(id => id + 1); setJawwalBankFileSessionId(id => id + 1); setJawwalCashFileSessionId(id => id + 1);
+    setJawwalBankFile(null); setJawwalBankHeaders([]); setJawwalBankRows([]); setJawwalBankMap({date:"",desc:"",debit:"",credit:"",ref:"",totalAmount:"",movementAmount:"",direction:""}); setJawwalBankSwap(false); setJawwalBankOptions({useTotalAmount:true,readDebitCredit:true});
     setJawwalCashFile(null); setJawwalCashHeaders([]); setJawwalCashRows([]); setJawwalCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setJawwalCashSwap(false);
     setPlatformNames({ bank: "بنك فلسطين", wallet: "بال بي", jawwal: "جوال بي" }); setCustomPlatforms([]); nextCustomPlatformId.current = 0;
     setBankFileSnapshots([]); setCashFileSnapshots([]);
     setWalletBankFileSnapshots([]); setWalletCashFileSnapshots([]);
     setJawwalBankFileSnapshots([]); setJawwalCashFileSnapshots([]);
     setManualGroups([]); setSavedMatches([]); setRejected(new Set());
+    setBankSplits([]); setCutoffBatches([]); setClearingGroups([]);
     setVisaItems([]); setHeldItems([]); setReturnedHeldBank([]); setReturnedHeldCashier([]);
     setRejectedSpecialCashierIds(new Set());
     setResults(null); setTab("saved");
@@ -3093,12 +3858,12 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
 
   const handleClearPlatform = (plat: "bank" | "cash" | "walletBank" | "walletCash" | "jawwalBank" | "jawwalCash") => {
     if (!window.confirm("مسح ملف هذه المنصة والملفات المحفوظة للاسترجاع الخاصة بها فقط؟\nباقي المنصات والمطابقات المؤكدة رح تضل كما هي.")) return;
-    if (plat === "bank") { setBankFile(null); setBankH([]); setBankRows([]); setBankMap({date:"",desc:"",debit:"",credit:"",accountType:"",ref:""}); setBankSwap(false); setBankFileSessionId(0); setBankFileSnapshots([]); }
-    if (plat === "cash") { setCashFile(null); setCashH([]); setCashRows([]); setCashMap({date:"",name:"",debit:"",credit:"",accountType:"",ref:""}); setCashSwap(false); setCashFileSessionId(0); setCashFileSnapshots([]); }
-    if (plat === "walletBank") { setWalletBankFile(null); setWalletBankHeaders([]); setWalletBankRows([]); setWalletBankMap({date:"",desc:"",debit:"",credit:"",ref:""}); setWalletBankSwap(false); setWalletBankFileSnapshots([]); }
-    if (plat === "walletCash") { setWalletCashFile(null); setWalletCashHeaders([]); setWalletCashRows([]); setWalletCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setWalletCashSwap(false); setWalletCashFileSnapshots([]); }
-    if (plat === "jawwalBank") { setJawwalBankFile(null); setJawwalBankHeaders([]); setJawwalBankRows([]); setJawwalBankMap({date:"",desc:"",debit:"",credit:"",ref:""}); setJawwalBankSwap(false); setJawwalBankFileSnapshots([]); }
-    if (plat === "jawwalCash") { setJawwalCashFile(null); setJawwalCashHeaders([]); setJawwalCashRows([]); setJawwalCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setJawwalCashSwap(false); setJawwalCashFileSnapshots([]); }
+    if (plat === "bank") { setBankFile(null); setBankH([]); setBankRows([]); setBankMap({date:"",desc:"",debit:"",credit:"",accountType:"",ref:""}); setBankSwap(false); setBankFileSessionId(id => id + 1); setBankFileSnapshots([]); }
+    if (plat === "cash") { setCashFile(null); setCashH([]); setCashRows([]); setCashMap({date:"",name:"",debit:"",credit:"",accountType:"",ref:""}); setCashSwap(false); setCashFileSessionId(id => id + 1); setCashFileSnapshots([]); }
+    if (plat === "walletBank") { setWalletBankFile(null); setWalletBankHeaders([]); setWalletBankRows([]); setWalletBankMap({date:"",desc:"",debit:"",credit:"",ref:""}); setWalletBankSwap(false); setWalletBankFileSessionId(id => id + 1); setWalletBankFileSnapshots([]); }
+    if (plat === "walletCash") { setWalletCashFile(null); setWalletCashHeaders([]); setWalletCashRows([]); setWalletCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setWalletCashSwap(false); setWalletCashFileSessionId(id => id + 1); setWalletCashFileSnapshots([]); }
+    if (plat === "jawwalBank") { setJawwalBankFile(null); setJawwalBankHeaders([]); setJawwalBankRows([]); setJawwalBankMap({date:"",desc:"",debit:"",credit:"",ref:"",totalAmount:"",movementAmount:"",direction:""}); setJawwalBankSwap(false); setJawwalBankOptions({useTotalAmount:true,readDebitCredit:true}); setJawwalBankFileSessionId(id => id + 1); setJawwalBankFileSnapshots([]); }
+    if (plat === "jawwalCash") { setJawwalCashFile(null); setJawwalCashHeaders([]); setJawwalCashRows([]); setJawwalCashMap({date:"",name:"",debit:"",credit:"",ref:""}); setJawwalCashSwap(false); setJawwalCashFileSessionId(id => id + 1); setJawwalCashFileSnapshots([]); }
     setResults(null);
     setToast("تم مسح بيانات هذه المنصة ✓");
   };
@@ -3115,6 +3880,18 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     bankHeaders, bankRowsRaw, bankMap, bankSwap, bankFileSessionId,
     cashHeaders, cashRowsRaw, cashMap, cashSwap, cashFileSessionId,
     manualGroups, savedMatches,
+    bankSplits, cutoffBatches, clearingGroups,
+    nameAliases,
+    rejectedSpecialCashierIds: Array.from(rejectedSpecialCashierIds),
+    amountTolerancePercent,
+    bankFileSnapshots, cashFileSnapshots, walletBankFileSnapshots, walletCashFileSnapshots,
+    jawwalBankFileSnapshots, jawwalCashFileSnapshots,
+    stageAInvoices,
+    walletBankHeaders, walletBankRows, walletBankMap, walletBankSwap, walletBankFileSessionId,
+    walletCashHeaders, walletCashRows, walletCashMap, walletCashSwap, walletCashFileSessionId,
+    jawwalBankHeaders, jawwalBankRows, jawwalBankMap, jawwalBankSwap, jawwalBankOptions, jawwalBankFileSessionId,
+    jawwalCashHeaders, jawwalCashRows, jawwalCashMap, jawwalCashSwap, jawwalCashFileSessionId,
+    platformNames, customPlatforms,
     rejectedPairs: Array.from(rejectedPairs),
     visaItems, heldItems, returnedHeldBank, returnedHeldCashier
   });
@@ -3126,30 +3903,144 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     setCashH(p.cashHeaders || []); setCashRows(p.cashRowsRaw || []);
     setCashMap({ date: p.cashMap?.date ?? "", name: p.cashMap?.name ?? "", debit: p.cashMap?.debit ?? "", credit: p.cashMap?.credit ?? "", accountType: p.cashMap?.accountType ?? "", ref: (p.cashMap as any)?.ref ?? "" }); setCashSwap(!!p.cashSwap);
     setCashFileSessionId(p.cashFileSessionId ?? 0);
+    setStageAInvoices(p.stageAInvoices ?? []);
+    setWalletBankHeaders(p.walletBankHeaders ?? []); setWalletBankRows(p.walletBankRows ?? []);
+    setWalletBankMap({ date: p.walletBankMap?.date ?? "", desc: p.walletBankMap?.desc ?? "", debit: p.walletBankMap?.debit ?? "", credit: p.walletBankMap?.credit ?? "", ref: p.walletBankMap?.ref ?? "" });
+    setWalletBankSwap(p.walletBankSwap ?? false); setWalletBankFileSessionId(p.walletBankFileSessionId ?? 0);
+    setWalletCashHeaders(p.walletCashHeaders ?? []); setWalletCashRows(p.walletCashRows ?? []);
+    setWalletCashMap({ date: p.walletCashMap?.date ?? "", name: p.walletCashMap?.name ?? "", debit: p.walletCashMap?.debit ?? "", credit: p.walletCashMap?.credit ?? "", ref: p.walletCashMap?.ref ?? "" });
+    setWalletCashSwap(p.walletCashSwap ?? false); setWalletCashFileSessionId(p.walletCashFileSessionId ?? 0);
+    setJawwalBankHeaders(p.jawwalBankHeaders ?? []); setJawwalBankRows(p.jawwalBankRows ?? []);
+    setJawwalBankMap({ date: p.jawwalBankMap?.date ?? "", desc: p.jawwalBankMap?.desc ?? "", debit: p.jawwalBankMap?.debit ?? "", credit: p.jawwalBankMap?.credit ?? "", ref: p.jawwalBankMap?.ref ?? "", totalAmount: p.jawwalBankMap?.totalAmount ?? "", movementAmount: p.jawwalBankMap?.movementAmount ?? "", direction: p.jawwalBankMap?.direction ?? "" });
+    setJawwalBankSwap(p.jawwalBankSwap ?? false); setJawwalBankOptions({ useTotalAmount: true, readDebitCredit: true, ...(p.jawwalBankOptions ?? {}) });
+    setJawwalBankFileSessionId(p.jawwalBankFileSessionId ?? 0);
+    setJawwalCashHeaders(p.jawwalCashHeaders ?? []); setJawwalCashRows(p.jawwalCashRows ?? []);
+    setJawwalCashMap({ date: p.jawwalCashMap?.date ?? "", name: p.jawwalCashMap?.name ?? "", debit: p.jawwalCashMap?.debit ?? "", credit: p.jawwalCashMap?.credit ?? "", ref: p.jawwalCashMap?.ref ?? "" });
+    setJawwalCashSwap(p.jawwalCashSwap ?? false); setJawwalCashFileSessionId(p.jawwalCashFileSessionId ?? 0);
+    setPlatformNames({ bank: "بنك فلسطين", wallet: "بال بي", jawwal: "جوال بي", ...(p.platformNames ?? {}) });
+    setCustomPlatforms(p.customPlatforms ?? []);
+    nextCustomPlatformId.current = Math.max(0, ...(p.customPlatforms ?? []).map(platform => platform.id + 1));
+    nextCustomSourceSessionId.current = Math.max(1, ...(p.customPlatforms ?? []).flatMap(platform => [platform.transfer?.fileSessionId ?? 0, platform.invoice?.fileSessionId ?? 0]).map(id => id + 1));
     setManualGroups(p.manualGroups || []); setSavedMatches(p.savedMatches || []);
+    setBankSplits(p.bankSplits || []);
+    setCutoffBatches(p.cutoffBatches || []);
+    setClearingGroups(p.clearingGroups || []);
+    setNameAliases(p.nameAliases ?? {});
+    setRejectedSpecialCashierIds(normalizeIdSet(p.rejectedSpecialCashierIds));
+    setAmountTolerancePercent(Math.min(10, Math.max(0, p.amountTolerancePercent ?? 0.5)));
+    setBankFileSnapshots(p.bankFileSnapshots ?? []);
+    setCashFileSnapshots(p.cashFileSnapshots ?? []);
+    setWalletBankFileSnapshots(p.walletBankFileSnapshots ?? []);
+    setWalletCashFileSnapshots(p.walletCashFileSnapshots ?? []);
+    setJawwalBankFileSnapshots(p.jawwalBankFileSnapshots ?? []);
+    setJawwalCashFileSnapshots(p.jawwalCashFileSnapshots ?? []);
     setRejected(new Set(p.rejectedPairs || []));
     setVisaItems(p.visaItems || []);
-    setHeldItems(p.heldItems || []);
+    setHeldItems(dedupeHeldItems(p.heldItems || []));
     setReturnedHeldBank((p.returnedHeldBank as BankRow[]) ?? []);
     setReturnedHeldCashier((p.returnedHeldCashier as CashierRow[]) ?? []);
     setBankFile(null); setCashFile(null);
-    setResults(null);
+    setWalletBankFile(null); setWalletCashFile(null);
+    setJawwalBankFile(null); setJawwalCashFile(null);
+    setShowBankSnapshots(false); setShowCashSnapshots(false);
+    setShowWalletBankSnapshots(false); setShowWalletCashSnapshots(false);
+    setShowJawwalBankSnapshots(false); setShowJawwalCashSnapshots(false);
+    setResults(null); setTab("saved");
   };
 
   const handleImportResumeFile = async (f: File) => {
     setError(null);
-    const data = await extractResumeData(f);
-    if (!data) {
-      setError("هذا الملف مش ملف تصدير من البرنامج (أو الشيت الخاص بالاستكمال غير موجود فيه). تأكد إنه نفس ملف الإكسل اللي حمّلته من هون.");
+    try {
+      const data = await extractResumeData(f);
+      loadResumeData(data);
+      setToast("تم استرجاع بيانات العمل من الملف بنجاح ✓");
+    } catch (error) {
+      console.error("تعذّر استيراد ملف الاستكمال:", error);
+      setError(error instanceof Error ? error.message : "تعذّر استيراد الملف. تحقق من سلامته ثم حاول مجدداً.");
       return;
     }
-    loadResumeData(data);
-    setToast("تم استرجاع كل شغلك من الملف ✓");
   };
 
+  if (page === "splitTool") {
+    const unavailableBankKeys = new Set(matchableBank
+      .filter(row => savedBankIds.has(row.id))
+      .map(transactionKey));
+    const unavailableCashierKeys = new Set(activeCashier
+      .filter(row => savedCashierIds.has(row.id))
+      .map(transactionKey));
+    heldItems.filter(item => item.kind === "cashier").forEach(item => unavailableCashierKeys.add(`${item.fileSessionId}:${item.refId}`));
+    cutoffBatches.forEach(batch => {
+      unavailableCashierKeys.add(`${batch.aggregateSessionId}:${batch.aggregateId}`);
+      batch.sourceRows.forEach(row => unavailableCashierKeys.add(`${row.sessionId}:${row.id}`));
+    });
+    bankSplits.forEach(split => split.allocations.forEach(allocation => {
+      if (allocation.kind === "company" && allocation.cashierId != null) {
+        unavailableCashierKeys.add(`${allocation.cashierSessionId ?? 0}:${allocation.cashierId}`);
+      }
+    }));
+    return <SplitTool
+      bankRows={matchableBank}
+      cashierRows={activeCashier}
+      splits={bankSplits}
+      unavailableBankKeys={unavailableBankKeys}
+      unavailableCashierKeys={unavailableCashierKeys}
+      onSave={handleSaveBankSplit}
+      onDelete={handleDeleteBankSplit}
+      onBack={() => setPage("main")}
+    />;
+  }
+
+  if (page === "batchCutoff") {
+    const unavailableCashierKeys = new Set(activeCashier
+      .filter(row => savedCashierIds.has(row.id))
+      .map(transactionKey));
+    heldItems.filter(item => item.kind === "cashier").forEach(item => unavailableCashierKeys.add(`${item.fileSessionId}:${item.refId}`));
+    cutoffBatches.forEach(batch => {
+      unavailableCashierKeys.add(`${batch.aggregateSessionId}:${batch.aggregateId}`);
+      batch.sourceRows.forEach(row => unavailableCashierKeys.add(`${row.sessionId}:${row.id}`));
+    });
+    bankSplits.forEach(split => split.allocations.forEach(allocation => {
+      if (allocation.kind === "company" && allocation.cashierId != null) {
+        unavailableCashierKeys.add(`${allocation.cashierSessionId ?? 0}:${allocation.cashierId}`);
+      }
+    }));
+    return <BatchCutoffTool
+      cashierRows={activeCashier}
+      batches={cutoffBatches}
+      unavailableCashierKeys={unavailableCashierKeys}
+      onSave={handleSaveCutoffBatch}
+      onDelete={handleDeleteCutoffBatch}
+      onBack={() => setPage("main")}
+    />;
+  }
+
+  if (page === "clearing") {
+    const unavailableCashierKeys = new Set<string>([
+      ...activeCashier.filter(row => savedCashierIds.has(row.id)).map(transactionKey),
+      ...manualGroups.flatMap(group => group.cashiers.map(transactionKey)),
+      ...heldItems.filter(item => item.kind === "cashier").map(item => `${item.fileSessionId}:${item.refId}`),
+      ...cutoffBatches.flatMap(batch => [
+        `${batch.aggregateSessionId}:${batch.aggregateId}`,
+        ...batch.sourceRows.map(reference => `${reference.sessionId}:${reference.id}`),
+      ]),
+      ...bankSplits.flatMap(split => split.allocations
+        .filter(allocation => allocation.kind === "company" && allocation.cashierId != null)
+        .map(allocation => `${allocation.cashierSessionId ?? 0}:${allocation.cashierId}`)),
+      ...clearedCashierKeys,
+    ]);
+    return <ClearingTool
+      cashierRows={activeCashier}
+      groups={clearingGroups}
+      unavailableCashierKeys={unavailableCashierKeys}
+      onSave={handleSaveClearingGroup}
+      onDelete={handleDeleteClearingGroup}
+      onBack={() => setPage("main")}
+    />;
+  }
+
   if (page === "manual") {
-    const manualCashierRows = activeCashier.filter(c => !visaCashierIds.has(c.id) && !specialCashierIds.has(c.id));
-    const manualBankRows = activeBank;
+    const manualCashierRows = reconciliationCashierRows.filter(c => !visaCashierIds.has(c.id) && !specialCashierIds.has(c.id));
+    const manualBankRows = reconciliationBankRows;
     return (
       <ManualWorkbench
         bankRows={manualBankRows}
@@ -3167,7 +4058,16 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   }
 
   if (page === "report") {
-    return <ReportPage bank={activeBank} cashier={activeCashier} results={results} onBack={() => setPage("main")} />;
+    return <ReportPage
+      bank={reportBankRows}
+      cashier={reportCashierRows}
+      results={results}
+      bankSplits={bankSplits}
+      cutoffBatches={cutoffBatches}
+      clearingGroups={clearingGroups}
+      sourceCashierRows={activeCashier}
+      onBack={() => setPage("main")}
+    />;
   }
 
   if (page === "assist") {
@@ -3418,7 +4318,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                 </button>
               )}
             </div>
-            <DropZone file={bankFile} onFile={loadBank} onClear={() => { setBankFile(null); setBankH([]); setBankRows([]); setResults(null); }} />
+            <DropZone file={bankFile} onFile={loadBank} onClear={() => { setBankFile(null); setBankH([]); setBankRows([]); setResults(null); }} headers={bankHeaders} rows={bankRowsRaw} />
             {bankHeaders.length > 0 && (
               <div className="grid grid-cols-2 gap-2">
                 <Sel label="التاريخ" headers={bankHeaders} value={bankMap.date} onChange={v => setBankMap(m => ({ ...m, date: v }))} />
@@ -3475,7 +4375,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                 </button>
               )}
             </div>
-            <DropZone file={cashFile} onFile={loadCash} onClear={() => { setCashFile(null); setCashH([]); setCashRows([]); setResults(null); }} />
+            <DropZone file={cashFile} onFile={loadCash} onClear={() => { setCashFile(null); setCashH([]); setCashRows([]); setResults(null); }} headers={cashHeaders} rows={cashRowsRaw} />
             {cashHeaders.length > 0 && (
               <div className="grid grid-cols-2 gap-2">
                 <Sel label="التاريخ" headers={cashHeaders} value={cashMap.date} onChange={v => setCashMap(m => ({ ...m, date: v }))} />
@@ -3532,7 +4432,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                 </button>
               )}
             </div>
-            <DropZone file={walletBankFile} onFile={loadWalletBank} onClear={() => { setWalletBankFile(null); setWalletBankHeaders([]); setWalletBankRows([]); setResults(null); }} />
+            <DropZone file={walletBankFile} onFile={loadWalletBank} onClear={() => { setWalletBankFile(null); setWalletBankHeaders([]); setWalletBankRows([]); setResults(null); }} headers={walletBankHeaders} rows={walletBankRows} />
             {walletBankHeaders.length > 0 && <div className="grid grid-cols-2 gap-2">
               <Sel label="التاريخ" headers={walletBankHeaders} value={walletBankMap.date} onChange={v => setWalletBankMap(m => ({ ...m, date:v }))} />
               <Sel label="الإيضاحات / البيان" headers={walletBankHeaders} value={walletBankMap.desc} onChange={v => setWalletBankMap(m => ({ ...m, desc:v }))} />
@@ -3560,6 +4460,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                         <button key={i} onClick={() => {
                           setWalletBankHeaders(s.headers); setWalletBankRows(s.rows);
                           setWalletBankMap({ date:autoDetect(s.headers,HINTS.date), desc:autoDetect(s.headers,HINTS.desc), debit:autoDetect(s.headers,HINTS.debit), credit:autoDetect(s.headers,HINTS.credit), ref:autoDetect(s.headers,HINTS.ref) });
+                          setWalletBankFileSessionId(id => id + 1);
                           setShowWalletBankSnapshots(false); setResults(null);
                         }} className="w-full text-right px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2 transition-colors">
                           <RotateCcw className="w-3 h-3 text-slate-400"/>
@@ -3585,7 +4486,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                 </button>
               )}
             </div>
-            <DropZone file={walletCashFile} onFile={loadWalletCash} onClear={() => { setWalletCashFile(null); setWalletCashHeaders([]); setWalletCashRows([]); setResults(null); }} />
+            <DropZone file={walletCashFile} onFile={loadWalletCash} onClear={() => { setWalletCashFile(null); setWalletCashHeaders([]); setWalletCashRows([]); setResults(null); }} headers={walletCashHeaders} rows={walletCashRows} />
             {walletCashHeaders.length > 0 && <div className="grid grid-cols-2 gap-2">
               <Sel label="التاريخ" headers={walletCashHeaders} value={walletCashMap.date} onChange={v => setWalletCashMap(m => ({ ...m, date:v }))} />
               <Sel label="البيان" headers={walletCashHeaders} value={walletCashMap.name} onChange={v => setWalletCashMap(m => ({ ...m, name:v }))} />
@@ -3613,6 +4514,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                         <button key={i} onClick={() => {
                           setWalletCashHeaders(s.headers); setWalletCashRows(s.rows);
                           setWalletCashMap({ date:autoDetect(s.headers,HINTS.date), name:autoDetect(s.headers,HINTS.name), debit:autoDetect(s.headers,HINTS.debit), credit:autoDetect(s.headers,HINTS.credit), ref:autoDetect(s.headers,HINTS.ref) });
+                          setWalletCashFileSessionId(id => id + 1);
                           setShowWalletCashSnapshots(false); setResults(null);
                         }} className="w-full text-right px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2 transition-colors">
                           <RotateCcw className="w-3 h-3 text-slate-400"/>
@@ -3638,13 +4540,26 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                 </button>
               )}
             </div>
-            <DropZone file={jawwalBankFile} onFile={loadJawwalBank} onClear={() => { setJawwalBankFile(null); setJawwalBankHeaders([]); setJawwalBankRows([]); setResults(null); }} />
+            <DropZone file={jawwalBankFile} onFile={loadJawwalBank} onClear={() => { setJawwalBankFile(null); setJawwalBankHeaders([]); setJawwalBankRows([]); setResults(null); }} headers={jawwalBankHeaders} rows={jawwalBankRows} />
             {jawwalBankHeaders.length > 0 && <div className="grid grid-cols-2 gap-2">
               <Sel label="التاريخ" headers={jawwalBankHeaders} value={jawwalBankMap.date} onChange={v => setJawwalBankMap(m => ({ ...m, date:v }))} />
               <Sel label="الإيضاحات / البيان" headers={jawwalBankHeaders} value={jawwalBankMap.desc} onChange={v => setJawwalBankMap(m => ({ ...m, desc:v }))} />
+              <Sel label="عمود المبلغ الكلي" headers={jawwalBankHeaders} value={jawwalBankMap.totalAmount} onChange={v => setJawwalBankMap(m => ({ ...m, totalAmount:v }))} />
+              <Sel label="المبلغ البديل عند إيقاف الكلي" headers={jawwalBankHeaders} value={jawwalBankMap.movementAmount} onChange={v => setJawwalBankMap(m => ({ ...m, movementAmount:v }))} />
+              <Sel label="عمود تحديد مدين / دائن" headers={jawwalBankHeaders} value={jawwalBankMap.direction} onChange={v => setJawwalBankMap(m => ({ ...m, direction:v }))} />
               <Sel label="المبالغ المستلمة (مدين)" headers={jawwalBankHeaders} value={jawwalBankMap.debit} onChange={v => setJawwalBankMap(m => ({ ...m, debit:v }))} />
               <Sel label="المبالغ المدفوعة (دائن)" headers={jawwalBankHeaders} value={jawwalBankMap.credit} onChange={v => setJawwalBankMap(m => ({ ...m, credit:v }))} />
               <Sel label="رقم المرجع / الحوالة" headers={jawwalBankHeaders} value={jawwalBankMap.ref} onChange={v => setJawwalBankMap(m => ({ ...m, ref:v }))} />
+            </div>}
+            {jawwalBankHeaders.length > 0 && <div className="flex flex-wrap gap-4">
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <input type="checkbox" checked={jawwalBankOptions.useTotalAmount} onChange={e=>setJawwalBankOptions(options=>({...options,useTotalAmount:e.target.checked}))} className="rounded"/>
+                استخدام المبلغ الكلي
+              </label>
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <input type="checkbox" checked={jawwalBankOptions.readDebitCredit} onChange={e=>setJawwalBankOptions(options=>({...options,readDebitCredit:e.target.checked}))} className="rounded"/>
+                تحديد مستلم / مدفوع من عمود مدين / دائن
+              </label>
             </div>}
             {jawwalBankHeaders.length > 0 && (
               <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer w-fit">
@@ -3665,7 +4580,21 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                       {jawwalBankFileSnapshots.map((s, i) => (
                         <button key={i} onClick={() => {
                           setJawwalBankHeaders(s.headers); setJawwalBankRows(s.rows);
-                          setJawwalBankMap({ date:autoDetect(s.headers,HINTS.date), desc:autoDetect(s.headers,HINTS.desc), debit:autoDetect(s.headers,HINTS.debit), credit:autoDetect(s.headers,HINTS.credit), ref:autoDetect(s.headers,HINTS.ref) });
+                          const totalAmount = autoDetect(s.headers, HINTS.totalAmount);
+                          const direction = autoDetect(s.headers, HINTS.direction);
+                          const debit = autoDetect(s.headers, HINTS.debit);
+                          const credit = autoDetect(s.headers, HINTS.credit);
+                          setJawwalBankMap({
+                            date: autoDetect(s.headers, HINTS.date),
+                            desc: autoDetect(s.headers, HINTS.desc),
+                            debit: debit === direction ? "" : debit,
+                            credit: credit === direction ? "" : credit,
+                            ref: autoDetect(s.headers, HINTS.ref),
+                            totalAmount,
+                            movementAmount: autoDetect(s.headers, HINTS.movementAmount),
+                            direction,
+                          });
+                          setJawwalBankFileSessionId(id => id + 1);
                           setShowJawwalBankSnapshots(false); setResults(null);
                         }} className="w-full text-right px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2 transition-colors">
                           <RotateCcw className="w-3 h-3 text-slate-400"/>
@@ -3691,7 +4620,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                 </button>
               )}
             </div>
-            <DropZone file={jawwalCashFile} onFile={loadJawwalCash} onClear={() => { setJawwalCashFile(null); setJawwalCashHeaders([]); setJawwalCashRows([]); setResults(null); }} />
+            <DropZone file={jawwalCashFile} onFile={loadJawwalCash} onClear={() => { setJawwalCashFile(null); setJawwalCashHeaders([]); setJawwalCashRows([]); setResults(null); }} headers={jawwalCashHeaders} rows={jawwalCashRows} />
             {jawwalCashHeaders.length > 0 && <div className="grid grid-cols-2 gap-2">
               <Sel label="التاريخ" headers={jawwalCashHeaders} value={jawwalCashMap.date} onChange={v => setJawwalCashMap(m => ({ ...m, date:v }))} />
               <Sel label="البيان" headers={jawwalCashHeaders} value={jawwalCashMap.name} onChange={v => setJawwalCashMap(m => ({ ...m, name:v }))} />
@@ -3719,6 +4648,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                         <button key={i} onClick={() => {
                           setJawwalCashHeaders(s.headers); setJawwalCashRows(s.rows);
                           setJawwalCashMap({ date:autoDetect(s.headers,HINTS.date), name:autoDetect(s.headers,HINTS.name), debit:autoDetect(s.headers,HINTS.debit), credit:autoDetect(s.headers,HINTS.credit), ref:autoDetect(s.headers,HINTS.ref) });
+                          setJawwalCashFileSessionId(id => id + 1);
                           setShowJawwalCashSnapshots(false); setResults(null);
                         }} className="w-full text-right px-4 py-2.5 hover:bg-slate-50 flex items-center gap-2 transition-colors">
                           <RotateCcw className="w-3 h-3 text-slate-400"/>
@@ -3771,6 +4701,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                     <input type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void loadCustomSource(platform.id, slot, file); event.currentTarget.value = ""; }} />
                   </label>
                   {source && <>
+                    {source.rows.length > 0 && <button type="button" onClick={() => downloadCleanedSheet(source.fileName, source.headers, source.rows)} className="inline-flex items-center gap-1 rounded-md bg-emerald-50 px-2 py-1.5 text-xs font-medium text-emerald-700 hover:bg-emerald-100"><Download className="h-3.5 w-3.5"/>تنزيل Excel منظف</button>}
                     <label className="block text-xs font-medium">نوع الملف
                       <select value={source.role} onChange={(event) => updateSource((value) => ({ ...value, role: event.target.value as PlatformRole }))} className="mt-1 w-full rounded-lg border bg-white px-3 py-2">
                         <option value="invoice">فواتير</option><option value="transfer">حوالات</option><option value="other">شيء آخر</option>
@@ -3806,13 +4737,17 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
             className="px-6 py-2.5 bg-blue-600 text-white rounded-lg disabled:opacity-40 font-medium hover:bg-blue-700 transition-colors flex items-center gap-2">
              {loading ? <><span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />جاري المعالجة...</> : "تشغيل المطابقة"}
           </button>
-          {results && (
+          {(results || bankSplits.length > 0 || cutoffBatches.length > 0 || clearingGroups.length > 0) && (
             <button onClick={() => {
                 try {
-                  doExport(results, savedMatches, visaItems, heldItems, activeBank, activeCashier, buildResumeData());
+                  doExport(
+                    results ?? [], savedMatches, visaItems, heldItems,
+                    reportBankRows, reportCashierRows, buildResumeData(),
+                    nonReconciliationBankRows.map(({ bank }) => bank), bankSplits, cutoffBatches, clearingGroups, activeCashier, activeBank
+                  );
                 } catch (e) {
                   console.error("فشل تصدير الملف:", e);
-                  setError("صار خطأ أثناء تصدير الملف. جرّب تاني.");
+                  setError(e instanceof Error ? e.message : "صار خطأ أثناء تصدير الملف. جرّب تاني.");
                 }
               }}
               className="px-4 py-2.5 border rounded-lg flex items-center gap-1.5 bg-green-600 hover:bg-green-700 text-white border-transparent transition-colors font-medium text-sm">
@@ -3828,7 +4763,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
 
         {results && stats && (
           <div className="space-y-4">
-            <div className="grid grid-cols-4 sm:grid-cols-8 gap-2">
+            <div className="grid grid-cols-4 sm:grid-cols-5 md:grid-cols-10 gap-2">
                {([
                  { id: "saved", label: "مؤكد", count: stats.saved, color: "text-green-700" },
                  { id: "pending", label: "منتظر", count: stats.pending, color: "text-blue-700" },
@@ -3837,6 +4772,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                  { id: "jawwalPay", label: "جوال بي", count: stats.jawwalPay, color: "text-cyan-700" },
                  { id: "mahmoudWallet", label: "محفظة محمود", count: stats.mahmoudWallet, color: "text-violet-700" },
                  { id: "held", label: "معلّقة", count: stats.held, color: "text-orange-700" },
+                 { id: "nonReconciliationBank", label: "معلقات البنك غير التابعة للمطابقة", count: stats.nonReconciliationBank, color: "text-amber-700" },
                  { id: "uCashier", label: "فواتير بلا حوالات مطابقة", count: stats.uCashier, color: "text-red-700" },
                  { id: "uBank", label: "حوالات بلا فواتير مسجلة", count: stats.uBank, color: "text-red-700" },
               ] as const).map(t => (
@@ -4411,6 +5347,39 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                     {!heldItems.length && <tr><td colSpan={7} className="py-10 text-center text-muted-foreground text-xs">لا توجد عناصر معلّقة حالياً. علّق أي حوالة أو فاتورة من تبويب "منتظر" أو "كاشير/بنك غير متطابق" لمطابقتها لاحقاً.</td></tr>}
                   </tbody>
                 </table>
+              )}
+
+              {tab === "nonReconciliationBank" && (
+                <div>
+                  <p className="border-b border-amber-100 bg-amber-50/70 px-4 py-3 text-xs text-amber-900">
+                    هذه الحركات محفوظة للرجوع إليها، لكنها مستبعدة من المطابقة ومجاميع التقارير.
+                  </p>
+                  <table className="w-full text-sm">
+                    <thead><tr className="bg-muted text-xs">
+                      <th className="px-3 py-2.5 text-right">التاريخ</th>
+                      <th className="px-3 py-2.5 text-right">البيان</th>
+                      <th className="px-3 py-2.5 text-right">التصنيف</th>
+                      <th className="px-3 py-2.5 text-right">النوع</th>
+                      <th className="px-3 py-2.5 text-right">مدين</th>
+                      <th className="px-3 py-2.5 text-right">دائن</th>
+                      <th className="px-3 py-2.5 text-right">المبلغ</th>
+                    </tr></thead>
+                    <tbody>
+                      {visibleNonReconciliationBankRows.map(({ bank, reason }) => (
+                        <tr key={`${bank._fileSessionId ?? bankFileSessionId}:${bank.id}`} className="border-t hover:bg-muted/20">
+                          <td className="px-3 py-2.5">{bank.date || "—"}</td>
+                          <td className="px-3 py-2.5">{bank.description}</td>
+                          <td className="px-3 py-2.5 text-amber-800">{reason}</td>
+                          <td className={`px-3 py-2.5 text-xs font-semibold ${bank.type === "مدفوع" ? "text-red-600" : "text-green-600"}`}>{bank.type}</td>
+                          <td className="px-3 py-2.5 font-mono">{fmtNum(bank.debit)}</td>
+                          <td className="px-3 py-2.5 font-mono">{fmtNum(bank.credit)}</td>
+                          <td className="px-3 py-2.5 font-mono font-semibold">{fmtNum(bank.rawAmount)}</td>
+                        </tr>
+                      ))}
+                      {!visibleNonReconciliationBankRows.length && <tr><td colSpan={7} className="py-10 text-center text-muted-foreground text-xs">لا توجد حركات مصنّفة هنا.</td></tr>}
+                    </tbody>
+                  </table>
+                </div>
               )}
 
               {tab === "uCashier" && (

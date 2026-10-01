@@ -102,6 +102,9 @@ export function AppShell() {
         {view === "assistant" && <App key="assistant" initialPage="assist" />}
         {view === "manual" && <App key="manual" initialPage="manual" />}
         {view === "report" && <App key="report" initialPage="report" />}
+        {view === "splitTool" && <App key="splitTool" initialPage="splitTool" />}
+        {view === "batchCutoff" && <App key="batchCutoff" initialPage="batchCutoff" />}
+        {view === "clearing" && <App key="clearing" initialPage="clearing" />}
         {view === "processor" && <AccountStatementProcessor />}
         {view === "profile" && <ProfileView username={username} onUsernameChange={setUsername} />}
         {view === "settings" && <SettingsView />}

@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState, type ChangeEvent, type DragEvent } from "react"
 import * as XLSX from "xlsx"
-import { AlertTriangle, ArrowDownToLine, ChevronDown, FileSpreadsheet, Plus, RefreshCw, ShieldCheck, Sparkles, Upload } from "lucide-react"
+import { AlertTriangle, ArrowDownToLine, ChevronDown, FileSpreadsheet, Plus, RefreshCw, ShieldCheck, Sparkles, Trash2, Upload, X } from "lucide-react"
 import { extractStatementRows, mergeSelectedStatements, type StatementCell, type StatementFormat } from "../lib/account-statement-processor"
 
 type StatementDocument = {
@@ -57,6 +57,7 @@ export function AccountStatementProcessor() {
   const [busy, setBusy] = useState(false)
   const [dragging, setDragging] = useState(false)
   const [errors, setErrors] = useState<string[]>([])
+  const [downloaded, setDownloaded] = useState(false)
   const merged = useMemo(() => mergeSelectedStatements(documents), [documents])
   const selectedCount = documents.reduce((count, item) => count + item.selectedRows.filter(Boolean).length, 0)
 
@@ -65,6 +66,7 @@ export function AccountStatementProcessor() {
     if (!files.length) return
     setBusy(true)
     setErrors([])
+    setDownloaded(false)
     const loaded: StatementDocument[] = []
     const failed: string[] = []
     for (const file of files) {
@@ -83,8 +85,16 @@ export function AccountStatementProcessor() {
     if (inputRef.current) inputRef.current.value = ""
   }
 
-  const updateDocument = (id: string, updater: (document: StatementDocument) => StatementDocument) =>
+  const updateDocument = (id: string, updater: (document: StatementDocument) => StatementDocument) => {
+    setDownloaded(false)
     setDocuments((current) => current.map((document) => document.id === id ? updater(document) : document))
+  }
+
+  const removeDocument = (id: string) => {
+    setDocuments((current) => current.filter((document) => document.id !== id))
+    setExpanded((current) => current === id ? null : current)
+    setDownloaded(false)
+  }
 
   const download = () => {
     if (!merged.headers.length || !merged.rows.length) return
@@ -92,6 +102,7 @@ export function AccountStatementProcessor() {
     const workbook = XLSX.utils.book_new()
     XLSX.utils.book_append_sheet(workbook, sheet, "الكشف المنظف")
     XLSX.writeFile(workbook, "كشف-الحسابات-المنظف.xlsx")
+    setDownloaded(true)
   }
 
   return (
@@ -130,13 +141,22 @@ export function AccountStatementProcessor() {
         {!!documents.length && <>
           <section className="space-y-3">
             <div><h2 className="text-lg font-bold">اختر ما تريد الاحتفاظ به من كل ملف</h2><p className="mt-1 text-xs text-slate-500">عمود الرصيد غير محدد تلقائياً. يمكنك تعديله، وتحديد الحركات المستبعدة يدوياً.</p></div>
+            {downloaded && <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3">
+              <span className="text-sm font-medium text-emerald-900">تم تنزيل الملف. يمكنك حذف الكشوفات الحالية والبدء من جديد.</span>
+              <button type="button" onClick={() => { setDocuments([]); setExpanded(null); setDownloaded(false) }} className="inline-flex items-center gap-2 rounded-lg bg-rose-700 px-3 py-2 text-xs font-semibold text-white hover:bg-rose-800">
+                <Trash2 className="h-4 w-4" />حذف الملفات المرفوعة
+              </button>
+            </div>}
             {documents.map((document, documentIndex) => {
               const isExpanded = expanded === document.id
               return <article key={document.id} className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
-                <button type="button" onClick={() => setExpanded(isExpanded ? null : document.id)} aria-expanded={isExpanded} className="flex w-full items-center justify-between gap-4 px-4 py-4 text-right sm:px-6">
-                  <span className="flex min-w-0 items-center gap-3"><FileSpreadsheet className="h-5 w-5 shrink-0 text-cyan-700" /><span className="min-w-0"><span className="block truncate text-sm font-bold">{documentIndex + 1}. {document.fileName}</span><span className="mt-1 block text-xs text-slate-500">{document.format === "bank" ? "كشف بنكي" : "كشف محاسبي"} · {document.selectedRows.filter(Boolean).length} من {document.rows.length} حركة محددة</span></span></span>
+                <div className="flex items-center gap-3 px-4 py-4 sm:px-6">
+                <button type="button" onClick={() => setExpanded(isExpanded ? null : document.id)} aria-expanded={isExpanded} className="flex min-w-0 flex-1 items-center justify-between gap-4 text-right">
+                  <span className="flex min-w-0 items-center gap-3"><FileSpreadsheet className="h-5 w-5 shrink-0 text-cyan-700" /><span className="min-w-0"><span className="block truncate text-sm font-bold">{documentIndex + 1}. {document.fileName}</span><span className="mt-1 block text-xs text-slate-500">{document.format === "bank" ? "كشف بنكي" : document.format === "ledger" ? "كشف محاسبي" : "كشف بعناوين أصلية"} · {document.selectedRows.filter(Boolean).length} من {document.rows.length} حركة محددة</span></span></span>
                   <ChevronDown className={`h-5 w-5 shrink-0 transition-transform ${isExpanded ? "rotate-180" : ""}`} />
                 </button>
+                {downloaded && <button type="button" aria-label={`حذف ${document.fileName}`} title="حذف هذا الملف" onClick={() => removeDocument(document.id)} className="shrink-0 rounded-lg p-1.5 text-rose-700 hover:bg-rose-50"><X className="h-4 w-4" /></button>}
+                </div>
                 {isExpanded && <div className="border-t border-slate-100 p-4 sm:p-6">
                   <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h3 className="text-sm font-bold">الأعمدة</h3><div className="flex gap-2"><button onClick={() => updateDocument(document.id, (item) => ({ ...item, selectedColumns: item.headers.map(() => true) }))} className="rounded-lg border px-3 py-1.5 text-xs">تحديد الكل</button><button onClick={() => updateDocument(document.id, (item) => ({ ...item, selectedColumns: item.headers.map(() => false) }))} className="rounded-lg border px-3 py-1.5 text-xs">إلغاء الكل</button></div></div>
                   <div className="mb-5 flex flex-wrap gap-2">{document.headers.map((header, index) => <label key={`${header}-${index}`} className={`inline-flex cursor-pointer items-center gap-2 rounded-xl border px-3 py-2 text-sm ${document.selectedColumns[index] ? "border-cyan-200 bg-cyan-50" : "border-slate-200 text-slate-500"}`}><input type="checkbox" checked={document.selectedColumns[index]} onChange={() => updateDocument(document.id, (item) => ({ ...item, selectedColumns: item.selectedColumns.map((selected, column) => column === index ? !selected : selected) }))} className="h-4 w-4 accent-cyan-700" />{header}</label>)}</div>

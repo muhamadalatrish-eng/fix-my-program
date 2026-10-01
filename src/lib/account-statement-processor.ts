@@ -2,7 +2,7 @@ export type StatementCell = string | number | boolean | Date | null | undefined
 
 export type StatementSheet = { rows: StatementCell[][] }
 
-export type StatementFormat = "ledger" | "bank"
+export type StatementFormat = "ledger" | "bank" | "generic"
 
 export type ExtractedStatement = {
   format: StatementFormat
@@ -28,13 +28,59 @@ type HeaderIndexes =
 export const LEDGER_HEADERS = ["رقم القيد", "التاريخ", "المدين", "الدائن", "الرصيد", "البيان", "بيان القيد"]
 export const BANK_HEADERS = ["التاريخ البنكي", "التاريخ الفعلي", "الإيضاحات", "تاريخ الحق", "مبالغ مدفوعة", "مبالغ مستلمة", "الرصيد (شيكل)"]
 
-function normalizeHeader(value: StatementCell): string {
+export function normalizeHeader(value: StatementCell): string {
   return String(value ?? "")
     .normalize("NFKC")
     .toLowerCase()
     .replace(/[\u064B-\u065F\u0670\u0640]/g, "")
     .replace(/[أإآ]/g, "ا")
     .replace(/\s+/g, "")
+}
+
+function headerCandidateScore(row: StatementCell[]): number {
+  const indexes = row.map((cell, index) => hasValue(cell) ? index : -1).filter((index) => index >= 0)
+  if (indexes.length < 2) return -1
+  const normalized = indexes.map((index) => normalizeHeader(row[index]))
+  if (new Set(normalized).size < 2) return -1
+  const labels = indexes.filter((index) => typeof row[index] === "string" && !/^[\d.,-]+$/.test(String(row[index]).trim())).length
+  if (labels / indexes.length < 0.75) return -1
+  const hints = /date|description|details|narrative|name|debit|credit|money|amount|paid|received|balance|reference|transaction|رقم|تاريخ|بيان|وصف|تفاصيل|مدين|دائن|مبلغ|مدفوع|مستلم|رصيد|مرجع|حركة|ايضاح|ملاحظات/i
+  return indexes.reduce((score, index) => score + (hints.test(String(row[index])) ? 1 : 0), 0)
+}
+
+export function parseTabularRows(rows: StatementCell[][]): { headers: string[]; rows: StatementCell[][] } | null {
+  let headerIndex = -1
+  let bestScore = -1
+  for (let index = 0; index < rows.length; index += 1) {
+    const score = headerCandidateScore(rows[index])
+    if (score < 0) continue
+    const headerIndexes = rows[index].map((cell, column) => hasValue(cell) ? column : -1).filter((column) => column >= 0)
+    const nextData = rows.slice(index + 1).find((row) => row.some(hasValue))
+    if (!nextData || !headerIndexes.some((column) => hasValue(nextData[column]))) continue
+    if (score > bestScore) {
+      bestScore = score
+      headerIndex = index
+    }
+  }
+  if (headerIndex < 0) return null
+
+  const sourceHeaders = rows[headerIndex]
+  const columns = sourceHeaders.map((cell, index) => ({ index, header: hasValue(cell) ? String(cell).trim() : "" })).filter((column) => column.header)
+  const headers: string[] = []
+  const used = new Map<string, number>()
+  for (const column of columns) {
+    const count = (used.get(normalizeHeader(column.header)) ?? 0) + 1
+    used.set(normalizeHeader(column.header), count)
+    headers.push(count > 1 ? `${column.header} (${count})` : column.header)
+  }
+  const normalizedHeaders = columns.map((column) => normalizeHeader(column.header))
+  const data = rows.slice(headerIndex + 1).filter((row) => row.some(hasValue)).flatMap((row) => {
+    const normalizedRow = columns.map((column) => normalizeHeader(row[column.index]))
+    if (normalizedRow.length === normalizedHeaders.length && normalizedRow.every((cell, index) => cell === normalizedHeaders[index])) return []
+    if (!columns.some((column) => hasValue(row[column.index]))) return []
+    return [columns.map((column) => row[column.index] ?? "")]
+  })
+  return { headers, rows: data }
 }
 
 function findHeaderIndexes(row: StatementCell[]): HeaderIndexes | null {
@@ -63,7 +109,14 @@ function findHeaderIndexes(row: StatementCell[]): HeaderIndexes | null {
     find((header) => /^(ال)?بيان$|وصف|تفاصيل|description|details/.test(header)),
     find((header) => /بيان.*قيد|قيد.*بيان|نوعالحركة|نوعالعملية/.test(header)),
   ]
-  if (entryNumber >= 0 && transactionIndexes[1] >= 0 && transactionIndexes[2] >= 0 && transactionIndexes[3] >= 0 && transactionIndexes.slice(5).some((index) => index >= 0)) {
+  if (
+    entryNumber >= 0 &&
+    transactionIndexes[1] >= 0 &&
+    transactionIndexes[2] >= 0 &&
+    transactionIndexes[3] >= 0 &&
+    transactionIndexes[2] !== transactionIndexes[3] &&
+    transactionIndexes.slice(5).some((index) => index >= 0)
+  ) {
     return {
       format: "ledger",
       indexes: transactionIndexes,
@@ -79,6 +132,27 @@ function hasValue(value: StatementCell): boolean {
 }
 
 export function extractStatementRows(sheets: StatementSheet[]): ExtractedStatement | null {
+  const special = extractRecognizedStatementRows(sheets)
+  if (special) return special
+
+  let headers: string[] | null = null
+  const rows: StatementCell[][] = []
+  let sourceRows = 0
+  for (const sheet of sheets) {
+    sourceRows += sheet.rows.length
+    const parsed = parseTabularRows(sheet.rows)
+    if (!parsed) continue
+    if (!headers) headers = parsed.headers
+    const sourceIndex = new Map(parsed.headers.map((header, index) => [normalizeHeader(header), index]))
+    rows.push(...parsed.rows.map((row) => headers!.map((header) => {
+      const index = sourceIndex.get(normalizeHeader(header))
+      return index === undefined ? "" : row[index] ?? ""
+    })))
+  }
+  return headers ? { format: "generic", headers, rows, headerBlocks: sheets.length, sourceRows } : null
+}
+
+function extractRecognizedStatementRows(sheets: StatementSheet[]): ExtractedStatement | null {
   const rows: StatementCell[][] = []
   let format: StatementFormat | null = null
   let headers: string[] = []
@@ -104,10 +178,7 @@ export function extractStatementRows(sheets: StatementSheet[]): ExtractedStateme
         }
         continue
       }
-      if (!sourceRow.some(hasValue)) {
-        readingTransactions = false
-        continue
-      }
+      if (!sourceRow.some(hasValue)) continue
       if (!active || !readingTransactions || active.format !== format) continue
       if (active.format === "bank") {
         const transaction = active.transactionIndexes.map((index) => sourceRow[index] ?? "")
@@ -122,7 +193,7 @@ export function extractStatementRows(sheets: StatementSheet[]): ExtractedStateme
       }
     }
   }
-  return format ? { format, headers, rows, headerBlocks, sourceRows } : null
+  return format && rows.length ? { format, headers, rows, headerBlocks, sourceRows } : null
 }
 
 export function mergeSelectedStatements(

@@ -1,8 +1,8 @@
 "use client"
 
-import { User, Settings, Scale, LogOut, ChevronLeft, Sparkles, Link2, BarChart3, FileSpreadsheet } from "lucide-react"
+import { User, Settings, Scale, LogOut, ChevronLeft, Sparkles, Link2, BarChart3, FileSpreadsheet, Split, CalendarRange, ListChecks } from "lucide-react"
 
-export type ViewId = "recon" | "assistant" | "manual" | "report" | "processor" | "profile" | "settings"
+export type ViewId = "recon" | "assistant" | "manual" | "report" | "splitTool" | "batchCutoff" | "clearing" | "processor" | "profile" | "settings"
 
 export function AppSidebar({
   active,
@@ -24,6 +24,9 @@ export function AppSidebar({
     { id: "assistant", label: "مساعد المطابقة", icon: Sparkles },
     { id: "manual", label: "المطابقة اليدوية", icon: Link2 },
     { id: "report", label: "تقرير الفروقات", icon: BarChart3 },
+    { id: "splitTool", label: "أداة تجزئة الحوالات", icon: Split },
+    { id: "batchCutoff", label: "أداة تجميع فترة التعطل", icon: CalendarRange },
+    { id: "clearing", label: "شاشة تسكير السندات", icon: ListChecks },
     { id: "processor", label: "معالج كشوفات الحسابات", icon: FileSpreadsheet },
     { id: "profile", label: "الملف الشخصي", icon: User },
     { id: "settings", label: "الإعدادات", icon: Settings },
