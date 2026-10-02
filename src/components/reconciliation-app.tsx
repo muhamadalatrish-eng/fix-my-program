@@ -4,8 +4,8 @@ import React, { useState, useCallback, useMemo, useEffect, useRef, useDeferredVa
 import * as XLSX from "xlsx";
 import Reconciliation2, { type StageAResult } from "./Reconciliation2";
 import { BatchCutoffTool, ClearingTool, SplitTool, syntheticTransactionId, transactionKey, type BankSplit, type ClearingGroup, type CutoffBatch, type CutoffRowRef, type SplitAllocation, type ToolBankRow, type ToolCashierRow } from "./reconciliation-tools";
-import { Upload, FileSpreadsheet, Download, ChevronDown, X, Trash2, TriangleAlert as AlertTriangle, Check, Search, Link2, Link2Off, ChevronLeft, ChevronRight, CreditCard, Sparkles, Info, Save, Shield, FolderOpen, FolderPlus, RotateCcw, FolderMinus, GripVertical, Landmark, Users, BarChart3, ArrowUpRight, Plus } from "lucide-react";
-import { extractStatementRows, parseTabularRows, type StatementCell } from "../lib/account-statement-processor";
+import { Upload, FileSpreadsheet, Download, ChevronDown, X, Trash2, TriangleAlert as AlertTriangle, Check, Search, Link2, Link2Off, ChevronLeft, ChevronRight, CreditCard, Sparkles, Info, Save, Shield, FolderOpen, FolderPlus, RotateCcw, FolderMinus, GripVertical, Landmark, Users, BarChart3, ArrowUpRight, Plus, Star } from "lucide-react";
+import { cleanStatementText, extractStatementRows, parseTabularRows, removeStatementBalances, type StatementCell } from "../lib/account-statement-processor";
 
 // ─── Excel helpers ────────────────────────────────────────────────────────────
 function readFileBuf(f: File): Promise<ArrayBuffer> {
@@ -18,14 +18,26 @@ function readFileBuf(f: File): Promise<ArrayBuffer> {
 }
 function parseSheet(buf: ArrayBuffer) {
   const wb = XLSX.read(buf, { type: "array", cellDates: true });
-  for (const name of wb.SheetNames) {
-    const matrix = XLSX.utils.sheet_to_json<StatementCell[]>(wb.Sheets[name], { header: 1, defval: "", raw: false });
-    const parsed = parseTabularRows(matrix);
-    if (!parsed) continue;
-    const rows = parsed.rows.map((values) => Object.fromEntries(parsed.headers.map((header, index) => [header, values[index] ?? ""])));
-    return { headers: parsed.headers, rows };
+  const sheets = wb.SheetNames.map(name => ({
+    rows: XLSX.utils.sheet_to_json<StatementCell[]>(wb.Sheets[name], { header: 1, defval: "", raw: false }),
+  }));
+  const statement = extractStatementRows(sheets);
+  if (statement) {
+    return cleanStatementBalanceData(
+      statement.headers,
+      statement.rows.map(values => Object.fromEntries(statement.headers.map((header, index) => [header, values[index] ?? ""])))
+    );
+  }
+  for (const sheet of sheets) {
+    const parsed = parseTabularRows(sheet.rows);
+    if (parsed) return cleanStatementBalanceData(parsed.headers, parsed.rows.map(values =>
+      Object.fromEntries(parsed.headers.map((header, index) => [header, values[index] ?? ""]))
+    ));
   }
   throw new Error("لم أتمكن من العثور على صف عناوين وبيانات في الملف.");
+}
+function cleanStatementBalanceData(headers: string[], rows: Record<string, unknown>[]) {
+  return removeStatementBalances(headers, rows);
 }
 function parseJawwalPaySheet(buf: ArrayBuffer) {
   const workbook = XLSX.read(buf, { type: "array", cellDates: true });
@@ -47,7 +59,7 @@ function cleanJawwalPayLedger(headers: string[], rows: Record<string, unknown>[]
   if (!isLedger) return { headers: outputHeaders, rows };
   const outputRows = rows.filter(row => {
     return isJawwalPayLedgerMovement(headers, row);
-  }).map(row => Object.fromEntries(outputHeaders.map(header => [header, row[header] ?? ""])));
+  }).map(row => Object.fromEntries(outputHeaders.map(header => [header, cleanStatementText((row[header] ?? "") as StatementCell)])));
   return { headers: outputHeaders, rows: outputRows };
 }
 function isJawwalPayLedgerMovement(headers: string[], row: Record<string, unknown>) {
@@ -63,8 +75,9 @@ function isJawwalPayLedgerMovement(headers: string[], row: Record<string, unknow
   return /^\d+$/.test(entryNumber) && (debit > 0 || credit > 0);
 }
 function downloadCleanedSheet(fileName: string, headers: string[], rows: Record<string, unknown>[]) {
-  if (!headers.length || !rows.length) return;
-  const worksheet = XLSX.utils.aoa_to_sheet([headers, ...rows.map((row) => headers.map((header) => row[header] ?? ""))]);
+  const cleaned = cleanStatementBalanceData(headers, rows);
+  if (!cleaned.headers.length || !cleaned.rows.length) return;
+  const worksheet = XLSX.utils.aoa_to_sheet([cleaned.headers, ...cleaned.rows.map((row) => cleaned.headers.map((header) => row[header] ?? ""))]);
   const workbook = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(workbook, worksheet, "الكشف المنظف");
   const baseName = fileName.replace(/\.[^.]+$/, "") || "كشف";
@@ -83,6 +96,14 @@ function toNum(v: unknown): number {
 }
 function fmtNum(n: number) {
   return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+interface MatchReviewItem {
+  id: string;
+  savedMatch: SavedMatch;
+  cashier: CashierRow;
+  bank: BankRow;
+  addedAt: string;
 }
 
 function resolveDebitCredit(
@@ -304,6 +325,8 @@ interface SavedMatch {
   id: string;
   cashierId: number;
   bankId: number;
+  cashierSessionId?: number;
+  bankSessionId?: number;
   cashierName: string;
   bankDesc: string;
   amount: number;
@@ -523,9 +546,8 @@ function smartNameKey(value: string): string {
 }
 
 function extractMobileNumber(value: string): string | null {
-  const digits = value.replace(/\D/g, "");
-  const matches = digits.match(/(?:00970|970|0)?5\d{8}/g) ?? [];
-  const normalized = [...new Set(matches.map(number =>
+  const matches = value.match(/(?:^|\D)((?:00970|970)?0?5\d{8})(?=\D|$)/g) ?? [];
+  const normalized = [...new Set(matches.map(value => value.match(/(?:00970|970)?0?5\d{8}/)?.[0] ?? "").filter(Boolean).map(number =>
     number.startsWith("00970") ? `0${number.slice(5)}` :
     number.startsWith("970") ? `0${number.slice(3)}` :
     number.startsWith("5") ? `0${number}` : number
@@ -555,48 +577,57 @@ function reconcile(
   jawwalAccountType = "جوال بي",
 ): MatchResult[] {
   const results: MatchResult[] = [];
-  const usedBank = new Set<number>();
-  const usedCashier = new Set<number>();
+  const bankKey = (row: BankRow) => transactionKey(row);
+  const cashierKey = (row: CashierRow) => transactionKey(row);
+  const usedBank = new Set<string>();
+  const usedCashier = new Set<string>();
 
   const jawwalAccountKey = jawwalAccountType.trim().toLocaleLowerCase();
   const isJawwalRow = (row: BankRow | CashierRow) =>
     row.accountType.trim().toLocaleLowerCase() === jawwalAccountKey;
-  const eligibleSavedMatches = savedMatches.filter(match => {
-    const bankRow = bank.find(row => row.id === match.bankId);
-    const cashierRow = cashier.find(row => row.id === match.cashierId);
-    if (!bankRow || !cashierRow) return true;
+  const eligibleSavedMatches = savedMatches.flatMap(match => {
+    const bankRow = bank.find(row => row.id === match.bankId && (match.bankSessionId == null || (row._fileSessionId ?? 0) === match.bankSessionId));
+    const cashierRow = cashier.find(row => row.id === match.cashierId && (match.cashierSessionId == null || (row._fileSessionId ?? 0) === match.cashierSessionId));
+    if (!bankRow || !cashierRow) return [];
     const jawwalMatch = isJawwalRow(bankRow) || isJawwalRow(cashierRow);
-    if (!jawwalMatch) return true;
+    if (!jawwalMatch) return [{ match, bankRow, cashierRow }];
     const bankPhone = extractMobileNumber(bankRow.description);
     const cashierPhone = extractMobileNumber(`${cashierRow.rawName} ${cashierRow.name}`);
-    return isJawwalRow(bankRow) && isJawwalRow(cashierRow)
+    const isValid = isJawwalRow(bankRow) && isJawwalRow(cashierRow)
       && Boolean(bankPhone) && bankPhone === cashierPhone
       && Math.abs(bankRow.rawAmount - cashierRow.matchAmount) <= 0.01;
+    return isValid ? [{ match, bankRow, cashierRow }] : [];
   });
-  const savedKeys = new Set(eligibleSavedMatches.map(s => `${s.cashierId}-${s.bankId}`));
-  const savedCashierIds = new Set(eligibleSavedMatches.map(s => s.cashierId));
-  const savedBankIds = new Set(eligibleSavedMatches.map(s => s.bankId));
+  const claimedCashiers = new Set<string>();
+  const claimedBanks = new Set<string>();
+  const uniqueSavedMatches = eligibleSavedMatches.filter(({ cashierRow, bankRow }) => {
+    const cashierSourceKey = cashierKey(cashierRow);
+    const bankSourceKey = bankKey(bankRow);
+    if (claimedCashiers.has(cashierSourceKey) || claimedBanks.has(bankSourceKey)) return false;
+    claimedCashiers.add(cashierSourceKey);
+    claimedBanks.add(bankSourceKey);
+    return true;
+  });
+  const savedKeys = new Set(uniqueSavedMatches.map(({ cashierRow, bankRow }) => `${cashierKey(cashierRow)}-${bankKey(bankRow)}`));
+  const savedCashierIds = new Set(uniqueSavedMatches.map(({ cashierRow }) => cashierKey(cashierRow)));
+  const savedBankIds = new Set(uniqueSavedMatches.map(({ bankRow }) => bankKey(bankRow)));
 
-  eligibleSavedMatches.forEach(sm => {
-    const bankRow = bank.find(b => b.id === sm.bankId);
-    const cashierRow = cashier.find(c => c.id === sm.cashierId);
-    if (bankRow && cashierRow) {
-      results.push({ type: "saved", bank: bankRow, cashier: cashierRow, savedMatch: sm });
-      usedBank.add(bankRow.id);
-      usedCashier.add(cashierRow.id);
-    }
+  uniqueSavedMatches.forEach(({ match, bankRow, cashierRow }) => {
+    results.push({ type: "saved", bank: bankRow, cashier: cashierRow, savedMatch: match });
+    usedBank.add(bankKey(bankRow));
+    usedCashier.add(cashierKey(cashierRow));
   });
 
   const jawwalBanksByPhone = new Map<string, BankRow[]>();
   bank.forEach(row => {
-    if (usedBank.has(row.id) || savedBankIds.has(row.id) || !isJawwalRow(row)) return;
+    if (usedBank.has(bankKey(row)) || savedBankIds.has(bankKey(row)) || !isJawwalRow(row)) return;
     const phone = extractMobileNumber(row.description);
     if (!phone) return;
     jawwalBanksByPhone.set(phone, [...(jawwalBanksByPhone.get(phone) ?? []), row]);
   });
   const jawwalCashiersByPhone = new Map<string, CashierRow[]>();
   cashier.forEach(row => {
-    if (usedCashier.has(row.id) || savedCashierIds.has(row.id) || !isJawwalRow(row)) return;
+    if (usedCashier.has(cashierKey(row)) || savedCashierIds.has(cashierKey(row)) || !isJawwalRow(row)) return;
     const phone = extractMobileNumber(`${row.rawName} ${row.name}`);
     if (!phone) return;
     jawwalCashiersByPhone.set(phone, [...(jawwalCashiersByPhone.get(phone) ?? []), row]);
@@ -605,12 +636,12 @@ function reconcile(
     const banks = jawwalBanksByPhone.get(phone);
     if (!banks?.length) return;
     const possiblePairs = cashiers.flatMap(cashier => banks
-      .filter(bankRow => !usedBank.has(bankRow.id) && !rejectedPairs.has(`${cashier.id}-${bankRow.id}`))
+      .filter(bankRow => !usedBank.has(bankKey(bankRow)) && !rejectedPairs.has(`${cashier.id}-${bankRow.id}`))
       .map(bankRow => ({ cashier, bank: bankRow, amountDiff: Math.abs(bankRow.rawAmount - cashier.matchAmount) }))
       .filter(pair => pair.amountDiff <= 0.01))
       .sort((a, b) => a.amountDiff - b.amountDiff);
     possiblePairs.forEach(({ cashier: cashierRow, bank: bankRow, amountDiff }) => {
-      if (usedCashier.has(cashierRow.id) || usedBank.has(bankRow.id)) return;
+      if (usedCashier.has(cashierKey(cashierRow)) || usedBank.has(bankKey(bankRow))) return;
       results.push({
         type: "pending",
         bank: bankRow,
@@ -622,37 +653,37 @@ function reconcile(
         matchScore: 100,
         accountTypeDiff: false,
       });
-      usedCashier.add(cashierRow.id);
-      usedBank.add(bankRow.id);
+      usedCashier.add(cashierKey(cashierRow));
+      usedBank.add(bankKey(bankRow));
     });
   });
 
   cashier.forEach(c => {
-    if (usedCashier.has(c.id) || savedCashierIds.has(c.id)) return;
+    if (usedCashier.has(cashierKey(c)) || savedCashierIds.has(cashierKey(c))) return;
     if (jawwalPayCashierIds.has(c.id)) {
       results.push({ type: "jawwalPay", cashier: c });
-      usedCashier.add(c.id);
+      usedCashier.add(cashierKey(c));
       return;
     }
     if (mahmoudWalletCashierIds.has(c.id)) {
       results.push({ type: "mahmoudWallet", cashier: c });
-      usedCashier.add(c.id);
+      usedCashier.add(cashierKey(c));
       return;
     }
     if (visaCashierIds.has(c.id)) {
       results.push({ type:"visa", cashier:c });
-      usedCashier.add(c.id);
+      usedCashier.add(cashierKey(c));
     }
   });
 
   const candidates: Array<{ cashier: CashierRow; bank: BankRow; score: number; isApprox: boolean; matchType: string }> = [];
   cashier.forEach(c => {
-    if (usedCashier.has(c.id) || savedCashierIds.has(c.id) || visaCashierIds.has(c.id) || jawwalPayCashierIds.has(c.id) || mahmoudWalletCashierIds.has(c.id)) return;
+    if (usedCashier.has(cashierKey(c)) || savedCashierIds.has(cashierKey(c)) || visaCashierIds.has(c.id) || jawwalPayCashierIds.has(c.id) || mahmoudWalletCashierIds.has(c.id)) return;
     bank.forEach(b => {
-      if (usedBank.has(b.id) || savedBankIds.has(b.id) || c.type !== b.type) return;
+      if (usedBank.has(bankKey(b)) || savedBankIds.has(bankKey(b)) || c.type !== b.type) return;
       if (isJawwalRow(c) || isJawwalRow(b)) return;
       const pairKey = `${c.id}-${b.id}`;
-      if (rejectedPairs.has(pairKey) || savedKeys.has(pairKey)) return;
+      if (rejectedPairs.has(pairKey) || savedKeys.has(`${cashierKey(c)}-${bankKey(b)}`)) return;
       const amountTolerance = Math.max(0.01, c.matchAmount * amountTolerancePercent / 100);
       if (Math.abs(b.rawAmount - c.matchAmount) > amountTolerance) return;
       const aliasMatch = aliases[smartNameKey(c.name)] && b.description.split("/").some(segment => smartNameKey(segment) === aliases[smartNameKey(c.name)]);
@@ -665,7 +696,7 @@ function reconcile(
   });
   candidates.sort((a, b) => b.score - a.score);
   candidates.forEach(candidate => {
-    if (usedCashier.has(candidate.cashier.id) || usedBank.has(candidate.bank.id)) return;
+    if (usedCashier.has(cashierKey(candidate.cashier)) || usedBank.has(bankKey(candidate.bank))) return;
     results.push({
       type: "pending",
       bank: candidate.bank,
@@ -677,12 +708,12 @@ function reconcile(
       matchScore: Math.round(Math.min(1, candidate.score / 4.5) * 100),
       accountTypeDiff: accountTypesDiffer(candidate.bank.accountType, candidate.cashier.accountType)
     });
-    usedBank.add(candidate.bank.id);
-    usedCashier.add(candidate.cashier.id);
+    usedBank.add(bankKey(candidate.bank));
+    usedCashier.add(cashierKey(candidate.cashier));
   });
 
-  const remC = cashier.filter(c => !isJawwalRow(c) && !usedCashier.has(c.id) && !savedCashierIds.has(c.id) && !visaCashierIds.has(c.id) && !jawwalPayCashierIds.has(c.id) && !mahmoudWalletCashierIds.has(c.id));
-  const remB = bank.filter(b => !isJawwalRow(b) && !usedBank.has(b.id) && !savedBankIds.has(b.id));
+  const remC = cashier.filter(c => !isJawwalRow(c) && !usedCashier.has(cashierKey(c)) && !savedCashierIds.has(cashierKey(c)) && !visaCashierIds.has(c.id) && !jawwalPayCashierIds.has(c.id) && !mahmoudWalletCashierIds.has(c.id));
+  const remB = bank.filter(b => !isJawwalRow(b) && !usedBank.has(bankKey(b)) && !savedBankIds.has(bankKey(b)));
 
   const getBase = (name:string) => normName(name).split(" ").filter(t=>t.length>2&&t!=="al").slice(0,2).join(" ");
   const groups: Record<string,{cashiers:CashierRow[];banks:BankRow[]}> = {};
@@ -716,8 +747,9 @@ function reconcile(
     for (let i = 0; i < pairCount; i++) {
       const c = g.cashiers[i];
       const b = g.banks[i];
+      if (usedCashier.has(cashierKey(c)) || usedBank.has(bankKey(b))) continue;
       const pairKey = `${c.id}-${b.id}`;
-      if (!rejectedPairs.has(pairKey) && !savedKeys.has(pairKey)) {
+      if (!rejectedPairs.has(pairKey) && !savedKeys.has(`${cashierKey(c)}-${bankKey(b)}`)) {
         results.push({
           type: "pending",
           bank: b,
@@ -728,15 +760,15 @@ function reconcile(
           matchType: "bundle",
           amountDiff: 0
         });
-        usedCashier.add(c.id);
-        usedBank.add(b.id);
+        usedCashier.add(cashierKey(c));
+        usedBank.add(bankKey(b));
       }
     }
   });
 
   cashier.forEach(c => {
-    if (usedCashier.has(c.id) || savedCashierIds.has(c.id) || visaCashierIds.has(c.id) || jawwalPayCashierIds.has(c.id) || mahmoudWalletCashierIds.has(c.id)) return;
-    const hasAmt = bank.some(b => !isJawwalRow(b) && !usedBank.has(b.id) && !savedBankIds.has(b.id) &&
+    if (usedCashier.has(cashierKey(c)) || savedCashierIds.has(cashierKey(c)) || visaCashierIds.has(c.id) || jawwalPayCashierIds.has(c.id) || mahmoudWalletCashierIds.has(c.id)) return;
+    const hasAmt = bank.some(b => !isJawwalRow(b) && !usedBank.has(bankKey(b)) && !savedBankIds.has(bankKey(b)) &&
       b.type === c.type && Math.abs(b.rawAmount - c.matchAmount) <= 0.01);
     results.push({
       type:"unmatchedCashier",
@@ -746,8 +778,8 @@ function reconcile(
   });
 
   bank.forEach(b => {
-    if (usedBank.has(b.id) || savedBankIds.has(b.id)) return;
-    const hasAmt = cashier.some(c => !isJawwalRow(c) && !usedCashier.has(c.id) && !savedCashierIds.has(c.id) && !visaCashierIds.has(c.id) && !jawwalPayCashierIds.has(c.id) && !mahmoudWalletCashierIds.has(c.id) &&
+    if (usedBank.has(bankKey(b)) || savedBankIds.has(bankKey(b))) return;
+    const hasAmt = cashier.some(c => !isJawwalRow(c) && !usedCashier.has(cashierKey(c)) && !savedCashierIds.has(cashierKey(c)) && !visaCashierIds.has(c.id) && !jawwalPayCashierIds.has(c.id) && !mahmoudWalletCashierIds.has(c.id) &&
       c.type === b.type && Math.abs(c.matchAmount - b.rawAmount) <= 0.01);
     results.push({
       type:"unmatchedBank",
@@ -770,7 +802,15 @@ type MatchResult =
   | { type:"unmatchedCashier"; cashier:CashierRow; reason:"اختلاف في الاسم"|"غير موجودة في البنك" }
   | { type:"unmatchedBank"; bank:BankRow; reason:"اختلاف في الاسم"|"الحوالة غير موجودة في الكاشير" };
 
-type TabId = "saved"|"pending"|"manual"|"visa"|"jawwalPay"|"mahmoudWallet"|"held"|"nonReconciliationBank"|"uCashier"|"uBank";
+type TabId = "saved"|"pending"|"manual"|"visa"|"jawwalPay"|"mahmoudWallet"|"held"|"review"|"nonReconciliationBank"|"uCashier"|"uBank";
+
+interface MatchUndoSnapshot {
+  manualGroups: ManualMatchGroup[];
+  savedMatches: SavedMatch[];
+  rejectedPairs: Set<string>;
+  nameAliases: Record<string, string>;
+  selectedPendingKeys: Set<string>;
+}
 
 function scoreCandidate(
   cashierRow: CashierRow,
@@ -1090,6 +1130,7 @@ type ResumeData = {
   cashFileSessionId?: number;
   manualGroups: ManualMatchGroup[];
   savedMatches: SavedMatch[];
+  reviewItems?: MatchReviewItem[];
   rejectedPairs: string[];
   visaItems: VisaItem[];
   heldItems: HeldItem[];
@@ -1261,7 +1302,7 @@ async function parseAndMergeFiles(files: File[], role: MergeRole, previous?: { f
     fileName: file.name,
     ...(role === "jawwalBank" ? parseJawwalPaySheet(await readFileBuf(file)) : parseSheet(await readFileBuf(file))),
     }))),
-  ];
+  ].map(parsed => ({ ...parsed, ...cleanStatementBalanceData(parsed.headers, parsed.rows) }));
   const headers = [...parsedFiles[0].headers];
   const headerByRole = new Map<ColumnRole, string>();
   headers.forEach(header => {
@@ -1806,6 +1847,7 @@ interface SavedProject {
   cashFileSessionId?: number;
   manualGroups: ManualMatchGroup[];
   savedMatches: SavedMatch[];
+  reviewItems?: MatchReviewItem[];
   rejectedPairs: string[];
   visaItems: VisaItem[];
   heldItems: HeldItem[];
@@ -2490,7 +2532,7 @@ function ReportPage({
 
 type PageId = "main" | "manual" | "assist" | "report" | "recon2" | "recon2StageA" | "recon2Visa" | "splitTool" | "batchCutoff" | "clearing";
 
-export default function App({ initialPage = "recon2" }: { initialPage?: PageId } = {}) {
+export default function App({ initialPage = "recon2", onSafeActivities }: { initialPage?: PageId; onSafeActivities?: (activities: string[]) => void } = {}) {
   const [page, setPage] = useState<PageId>(initialPage);
   const [mainMode, setMainMode] = useState<"default" | "stageB">("default");
   const [sessionLoaded, setSessionLoaded] = useState(false);
@@ -2568,6 +2610,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
 
   const [manualGroups, setManualGroups]     = useState<ManualMatchGroup[]>([]);
   const [savedMatches, setSavedMatches]     = useState<SavedMatch[]>([]);
+  const [reviewItems, setReviewItems] = useState<MatchReviewItem[]>([]);
   const [bankSplits, setBankSplits] = useState<BankSplit[]>([]);
   const [cutoffBatches, setCutoffBatches] = useState<CutoffBatch[]>([]);
   const [clearingGroups, setClearingGroups] = useState<ClearingGroup[]>([]);
@@ -2577,6 +2620,9 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   const [expandedUnmatchedCashier, setExpandedUnmatchedCashier] = useState<number|null>(null);
   const [selectedPendingKeys, setSelectedPendingKeys] = useState<Set<string>>(new Set());
   const [selectedSavedIds, setSelectedSavedIds] = useState<Set<string>>(new Set());
+  const [canUndoMatch, setCanUndoMatch] = useState(false);
+  const [undoMatchCount, setUndoMatchCount] = useState(0);
+  const matchUndoRef = useRef<MatchUndoSnapshot | null>(null);
 
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerMode, setDrawerMode] = useState<"bank" | "cashier">("bank");
@@ -2660,6 +2706,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         setJawwalCashFileCount(session.jawwalCashFileSnapshots?.[0]?.fileCount ?? 0);
         setManualGroups(session.manualGroups || []);
         setSavedMatches(session.savedMatches || []);
+        setReviewItems(session.reviewItems || []);
         setBankSplits(session.bankSplits || []);
         setCutoffBatches(session.cutoffBatches || []);
         setClearingGroups(session.clearingGroups || []);
@@ -2691,7 +2738,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         platformNames, customPlatforms,
         bankFileSnapshots, cashFileSnapshots, walletBankFileSnapshots, walletCashFileSnapshots,
         jawwalBankFileSnapshots, jawwalCashFileSnapshots,
-        manualGroups, savedMatches, bankSplits, cutoffBatches, clearingGroups, nameAliases,
+        manualGroups, savedMatches, reviewItems, bankSplits, cutoffBatches, clearingGroups, nameAliases,
         rejectedPairs: Array.from(rejectedPairs),
         visaItems, heldItems, returnedHeldBank, returnedHeldCashier,
         rejectedSpecialCashierIds: Array.from(rejectedSpecialCashierIds)
@@ -2708,7 +2755,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     platformNames, customPlatforms,
     bankFileSnapshots, cashFileSnapshots, walletBankFileSnapshots, walletCashFileSnapshots,
     jawwalBankFileSnapshots, jawwalCashFileSnapshots,
-    manualGroups, savedMatches, bankSplits, cutoffBatches, clearingGroups, nameAliases, rejectedPairs,
+    manualGroups, savedMatches, reviewItems, bankSplits, cutoffBatches, clearingGroups, nameAliases, rejectedPairs,
     visaItems, heldItems, returnedHeldBank, returnedHeldCashier, rejectedSpecialCashierIds
   ]);
 
@@ -2841,7 +2888,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       if (rawAmount === 0) return null;
       return {
         id:i, date:fmtDate(bankMap.date?r[bankMap.date]:""),
-        description:String(bankMap.desc?r[bankMap.desc]:"").trim(),
+        description:String(cleanStatementText(String(bankMap.desc?r[bankMap.desc]:"")) ?? "").trim(),
         debit, credit, rawAmount, type,
         accountType: platformNames.bank,
         ref: String((bankMap as any).ref ? r[(bankMap as any).ref] : "").trim(),
@@ -2853,12 +2900,12 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   const parseWalletBankRows = useMemo(():BankRow[] => walletBankRows.map((r,i): BankRow | null => {
     const { debit, credit, rawAmount, type } = resolveDebitCredit(r, walletBankMap.debit, walletBankMap.credit, walletBankSwap);
     if (!rawAmount) return null;
-    return { id: 1000000 + i, date:fmtDate(walletBankMap.date ? r[walletBankMap.date] : ""), description:String(walletBankMap.desc ? r[walletBankMap.desc] : "").trim(), debit, credit, rawAmount, type, accountType:platformNames.wallet, ref:String(walletBankMap.ref ? r[walletBankMap.ref] : "").trim(), orig:r, _fileSessionId:walletBankFileSessionId };
+    return { id: 1000000 + i, date:fmtDate(walletBankMap.date ? r[walletBankMap.date] : ""), description:String(cleanStatementText(String(walletBankMap.desc ? r[walletBankMap.desc] : "")) ?? "").trim(), debit, credit, rawAmount, type, accountType:platformNames.wallet, ref:String(walletBankMap.ref ? r[walletBankMap.ref] : "").trim(), orig:r, _fileSessionId:walletBankFileSessionId };
   }).filter((r): r is BankRow => r !== null), [walletBankRows, walletBankMap, walletBankSwap, platformNames.wallet, walletBankFileSessionId]);
 
   const parsedCashier = useMemo(():CashierRow[]=>{
     const rows = cashRowsRaw.map((r,i): CashierRow | null => {
-      const rawName=String(cashMap.name?r[cashMap.name]:"").trim();
+      const rawName=String(cleanStatementText(String(cashMap.name?r[cashMap.name]:"")) ?? "").trim();
       const {name,notes}=parseCashierName(rawName);
       const {splitExpr,matchAmount:ma}=parseNotes(notes);
       const { debit, credit, rawAmount, type } = resolveDebitCredit(r, cashMap.debit, cashMap.credit, cashSwap);
@@ -2877,7 +2924,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   },[cashRowsRaw,cashMap,cashSwap,platformNames.bank,cashFileSessionId]);
 
   const parsedWalletCashier = useMemo(():CashierRow[] => walletCashRows.map((r,i): CashierRow | null => {
-    const rawName = String(walletCashMap.name ? r[walletCashMap.name] : "").trim();
+    const rawName = String(cleanStatementText(String(walletCashMap.name ? r[walletCashMap.name] : "")) ?? "").trim();
     const { name, notes } = parseCashierName(rawName);
     const { splitExpr, matchAmount: ma } = parseNotes(notes);
     const { debit, credit, rawAmount, type } = resolveDebitCredit(r, walletCashMap.debit, walletCashMap.credit, walletCashSwap);
@@ -2916,11 +2963,11 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     }
     const rawAmount = amount;
     if (!rawAmount) return null;
-    return { id: 4000000 + i, date:fmtDate(jawwalBankMap.date ? r[jawwalBankMap.date] : ""), description:String(jawwalBankMap.desc ? r[jawwalBankMap.desc] : "").trim(), debit, credit, rawAmount, type:finalType, accountType:platformNames.jawwal, ref:String(jawwalBankMap.ref ? r[jawwalBankMap.ref] : "").trim(), orig:r, _fileSessionId:jawwalBankFileSessionId };
+    return { id: 4000000 + i, date:fmtDate(jawwalBankMap.date ? r[jawwalBankMap.date] : ""), description:String(cleanStatementText(String(jawwalBankMap.desc ? r[jawwalBankMap.desc] : "")) ?? "").trim(), debit, credit, rawAmount, type:finalType, accountType:platformNames.jawwal, ref:String(jawwalBankMap.ref ? r[jawwalBankMap.ref] : "").trim(), orig:r, _fileSessionId:jawwalBankFileSessionId };
   }).filter((r): r is BankRow => r !== null), [jawwalBankRows, jawwalBankHeaders, jawwalBankMap, jawwalBankSwap, jawwalBankOptions, jawwalBankFileSessionId, platformNames.jawwal]);
 
   const parsedJawwalCashier = useMemo(():CashierRow[] => jawwalCashRows.map((r,i): CashierRow | null => {
-    const rawName = String(jawwalCashMap.name ? r[jawwalCashMap.name] : "").trim();
+    const rawName = String(cleanStatementText(String(jawwalCashMap.name ? r[jawwalCashMap.name] : "")) ?? "").trim();
     const { name, notes } = parseCashierName(rawName);
     const { splitExpr, matchAmount: ma } = parseNotes(notes);
     const { debit, credit, rawAmount, type } = resolveDebitCredit(r, jawwalCashMap.debit, jawwalCashMap.credit, jawwalCashSwap);
@@ -2941,7 +2988,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
           const { debit, credit, rawAmount, type } = resolveDebitCredit(row, source.map.debit, source.map.credit, false);
           const date = fmtDate(source.map.date ? row[source.map.date] : "");
           const ref = String(source.map.ref ? row[source.map.ref] : "").trim();
-          const description = String(source.map.description ? row[source.map.description] : "").trim();
+          const description = String(cleanStatementText(String(source.map.description ? row[source.map.description] : "")) ?? "").trim();
           const baseId = platform.id * 100000 + index;
           if (role === "transfer") {
             if (!rawAmount) return;
@@ -3152,7 +3199,11 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   const reportBankRows = splitAdjustedBank.reportRows;
   const reportCashierRows = cutoffAdjustedCashier.reportRows;
 
-  const savedKeys = useMemo(() => new Set(savedMatches.map(s => `${s.cashierId}-${s.bankId}`)), [savedMatches]);
+  const savedKeys = useMemo(() => new Set(savedMatches.flatMap(saved => {
+    const cashier = activeCashier.find(row => row.id === saved.cashierId && (saved.cashierSessionId == null || (row._fileSessionId ?? 0) === saved.cashierSessionId));
+    const bank = activeBank.find(row => row.id === saved.bankId && (saved.bankSessionId == null || (row._fileSessionId ?? 0) === saved.bankSessionId));
+    return cashier && bank ? [`${transactionKey(cashier)}-${transactionKey(bank)}`] : [];
+  })), [savedMatches, activeCashier, activeBank]);
   const savedCashierIds = useMemo(() => new Set(savedMatches.map(s => s.cashierId)), [savedMatches]);
   const savedBankIds = useMemo(() => new Set(savedMatches.map(s => s.bankId)), [savedMatches]);
   const pendingCashierIds = useMemo(
@@ -3214,7 +3265,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       unmatchedBankForSuggestions.forEach(b => {
         if (cashierRow.type !== b.type) return;
         const pairKey = `${cashierRow.id}-${b.id}`;
-        if (rejectedPairs.has(pairKey) || savedKeys.has(pairKey)) return;
+        if (rejectedPairs.has(pairKey) || savedKeys.has(`${transactionKey(cashierRow)}-${transactionKey(b)}`)) return;
         const sc = scoreCandidate(cashierRow, b, claimedNames, nameAliases);
         if (!sc) return;
         const cur = map.get(b.id);
@@ -3255,6 +3306,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       setToast("هذه الفاتورة موجودة بالفعل في قائمة الفيزا.");
       return;
     }
+    clearMatchUndo();
     const cleanName = extractVisaName(cashierRow.rawName);
     const item: VisaItem = {
       id: `visa-${Date.now()}-${cashierRow.id}`, cashierId: cashierRow.id,
@@ -3275,6 +3327,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   };
 
   const handleRejectSpecialCashier = (cashierRow: CashierRow) => {
+    clearMatchUndo();
     setRejectedSpecialCashierIds(prev => {
       const next = new Set(prev);
       next.add(cashierRow.id);
@@ -3283,14 +3336,34 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     setToast("تم ��فض التصنيف وإرجاع الفاتورة إلى المطابقة.");
   };
 
+  const handleAddReviewItem = (savedMatch: SavedMatch, cashier: CashierRow, bank: BankRow) => {
+    setReviewItems(previous => {
+      if (previous.some(item => item.id === savedMatch.id)) return previous;
+      return [...previous, {
+        id: savedMatch.id,
+        savedMatch: { ...savedMatch },
+        cashier: { ...cashier, orig: { ...cashier.orig } },
+        bank: { ...bank, orig: { ...bank.orig } },
+        addedAt: new Date().toLocaleString("ar-SA"),
+      }];
+    });
+    setToast("تمت إضافة نسخة من المطابقة إلى قائمة المراجعة دون تغيير المطابقة الأصلية.");
+  };
+
+  const handleCompleteReviewItem = (id: string) => {
+    setReviewItems(previous => previous.filter(item => item.id !== id));
+    setToast("تم حذف النسخة من قائمة المراجعة؛ المطابقة الأصلية لم تتغير.");
+  };
+
   const handleSaveMatch = (
     cashierRow: CashierRow,
     bankRow: BankRow,
     note?: string,
-    options?: { force?: boolean }
+    options?: { force?: boolean; replacePair?: { cashier: CashierRow; bank: BankRow } }
   ): SavedMatch | null => {
-    const pairKey = `${cashierRow.id}-${bankRow.id}`;
-    if (savedKeys.has(pairKey) && !options?.force) return null;
+    const savedPairKey = `${transactionKey(cashierRow)}-${transactionKey(bankRow)}`;
+    const rejectedPairKey = `${cashierRow.id}-${bankRow.id}`;
+    if (savedKeys.has(savedPairKey) && !options?.force) return null;
     const phone = extractMobileNumber(`${cashierRow.rawName} ${cashierRow.name}`);
     const cashierIsJawwal = cashierRow.accountType.trim().toLocaleLowerCase() === platformNames.jawwal.trim().toLocaleLowerCase();
     const bankIsJawwal = bankRow.accountType.trim().toLocaleLowerCase() === platformNames.jawwal.trim().toLocaleLowerCase();
@@ -3301,7 +3374,31 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         return null;
       }
     }
+    const existingOwners = savedMatches.filter(match =>
+      (match.cashierId === cashierRow.id && (match.cashierSessionId == null || match.cashierSessionId === (cashierRow._fileSessionId ?? 0))) ||
+      (match.bankId === bankRow.id && (match.bankSessionId == null || match.bankSessionId === (bankRow._fileSessionId ?? 0)))
+    );
+    const replacePairKey = options?.replacePair
+      ? `${transactionKey(options.replacePair.cashier)}-${transactionKey(options.replacePair.bank)}`
+      : "";
+    if (existingOwners.some(match => {
+      const ownerCashier = activeCashier.find(row => row.id === match.cashierId && (match.cashierSessionId == null || (row._fileSessionId ?? 0) === match.cashierSessionId));
+      const ownerBank = activeBank.find(row => row.id === match.bankId && (match.bankSessionId == null || (row._fileSessionId ?? 0) === match.bankSessionId));
+      return !ownerCashier || !ownerBank || `${transactionKey(ownerCashier)}-${transactionKey(ownerBank)}` !== replacePairKey;
+    })) {
+      setToast("لا يمكن تكرار الفاتورة أو الحوالة؛ إحدى الحركتين مستخدمة في مطابقة محفوظة.");
+      return null;
+    }
+    matchUndoRef.current = {
+      manualGroups: [...manualGroups],
+      savedMatches: [...savedMatches],
+      rejectedPairs: new Set(rejectedPairs),
+      nameAliases: { ...nameAliases },
+      selectedPendingKeys: new Set(selectedPendingKeys),
+    };
+    setCanUndoMatch(true);
     skipNextAutoReconcile.current = true;
+    setUndoMatchCount(1);
 
     const isAmountDiff = Math.abs(bankRow.rawAmount - cashierRow.amount) > 0.01;
     const ms = advancedMatchCheck(cashierRow.name, bankRow.description);
@@ -3318,6 +3415,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     const newSaved: SavedMatch = {
       id: `saved-${Date.now()}-${cashierRow.id}-${bankRow.id}`,
       cashierId: cashierRow.id, bankId: bankRow.id,
+      cashierSessionId: cashierRow._fileSessionId ?? 0, bankSessionId: bankRow._fileSessionId ?? 0,
       cashierName: cashierRow.name, bankDesc: bankRow.description,
       amount: bankRow.rawAmount, type: cashierRow.type,
       date: new Date().toLocaleDateString("ar-SA"),
@@ -3333,9 +3431,9 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       if (!prev) return prev;
       const savedResult: MatchResult = { type: "saved", cashier: cashierRow, bank: bankRow, savedMatch: newSaved };
       const next = prev.filter(result => {
-        const resultCashierId = "cashier" in result ? result.cashier.id : null;
-        const resultBankId = "bank" in result ? result.bank.id : null;
-        return resultCashierId !== cashierRow.id && resultBankId !== bankRow.id;
+        const sameCashier = "cashier" in result && transactionKey(result.cashier) === transactionKey(cashierRow);
+        const sameBank = "bank" in result && transactionKey(result.bank) === transactionKey(bankRow);
+        return !sameCashier && !sameBank;
       });
       return [savedResult, ...next];
     });
@@ -3343,10 +3441,33 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       setNameAliases(prev => ({ ...prev, [smartNameKey(cashierRow.name)]: smartNameKey(smartAliasTarget(cashierRow.name, bankRow.description)) }));
     }
     const nextRejected = new Set(rejectedPairs);
-    nextRejected.delete(pairKey);
+    nextRejected.delete(rejectedPairKey);
     setRejected(nextRejected);
+    onSafeActivities?.([`${cashierRow.name} ↔ ${bankRow.description} · ${fmtNum(bankRow.rawAmount)} ₪`]);
     setExpandedMatchKey(null);
     return newSaved;
+  };
+
+  const clearMatchUndo = () => {
+    matchUndoRef.current = null;
+    setCanUndoMatch(false);
+    setUndoMatchCount(0);
+  };
+
+  const handleUndoMatch = () => {
+    const snapshot = matchUndoRef.current;
+    if (!snapshot) return;
+    matchUndoRef.current = null;
+    setCanUndoMatch(false);
+    setUndoMatchCount(0);
+    skipNextAutoReconcile.current = false;
+    setManualGroups(snapshot.manualGroups);
+    setSavedMatches(snapshot.savedMatches);
+    setRejected(new Set(snapshot.rejectedPairs));
+    setNameAliases({ ...snapshot.nameAliases });
+    setSelectedPendingKeys(new Set(snapshot.selectedPendingKeys));
+    setResults(null);
+    setToast("تم التراجع عن آخر مطابقة");
   };
 
   const finishReplacement = (
@@ -3414,11 +3535,40 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   const handleSaveMatchesBulk = (pairs: Array<{cashier: CashierRow; bank: BankRow}>) => {
     if (!pairs.length) return;
     const newSaved: SavedMatch[] = [];
-    const usedKeysNow = new Set(savedKeys);
+    const usedCashiers = new Set(savedMatches.flatMap(saved => activeCashier
+      .filter(row => row.id === saved.cashierId && (saved.cashierSessionId == null || (row._fileSessionId ?? 0) === saved.cashierSessionId))
+      .map(transactionKey)));
+    const usedBanks = new Set(savedMatches.flatMap(saved => activeBank
+      .filter(row => row.id === saved.bankId && (saved.bankSessionId == null || (row._fileSessionId ?? 0) === saved.bankSessionId))
+      .map(transactionKey)));
+    const usedKeysNow = new Set(savedMatches.flatMap(saved => {
+      const cashier = activeCashier.find(row => row.id === saved.cashierId && (saved.cashierSessionId == null || (row._fileSessionId ?? 0) === saved.cashierSessionId));
+      const bank = activeBank.find(row => row.id === saved.bankId && (saved.bankSessionId == null || (row._fileSessionId ?? 0) === saved.bankSessionId));
+      return cashier && bank ? [`${transactionKey(cashier)}-${transactionKey(bank)}`] : [];
+    }));
+    let skipped = 0;
     pairs.forEach(({cashier: cashierRow, bank: bankRow}) => {
-      const pairKey = `${cashierRow.id}-${bankRow.id}`;
-      if (usedKeysNow.has(pairKey)) return;
+      const cashierKey = transactionKey(cashierRow);
+      const bankKey = transactionKey(bankRow);
+      const pairKey = `${cashierKey}-${bankKey}`;
+      const jawwalMatch = cashierRow.accountType.trim().toLocaleLowerCase() === platformNames.jawwal.trim().toLocaleLowerCase()
+        || bankRow.accountType.trim().toLocaleLowerCase() === platformNames.jawwal.trim().toLocaleLowerCase();
+      if (usedKeysNow.has(pairKey) || usedCashiers.has(cashierKey) || usedBanks.has(bankKey)) {
+        skipped++;
+        return;
+      }
+      if (jawwalMatch) {
+        const phone = extractMobileNumber(`${cashierRow.rawName} ${cashierRow.name}`);
+        const bothJawwal = cashierRow.accountType.trim().toLocaleLowerCase() === platformNames.jawwal.trim().toLocaleLowerCase()
+          && bankRow.accountType.trim().toLocaleLowerCase() === platformNames.jawwal.trim().toLocaleLowerCase();
+        if (!bothJawwal || !phone || phone !== extractMobileNumber(bankRow.description) || Math.abs(bankRow.rawAmount - cashierRow.matchAmount) > 0.01) {
+          skipped++;
+          return;
+        }
+      }
       usedKeysNow.add(pairKey);
+      usedCashiers.add(cashierKey);
+      usedBanks.add(bankKey);
 
       const isAmountDiff = Math.abs(bankRow.rawAmount - cashierRow.amount) > 0.01;
       const ms = advancedMatchCheck(cashierRow.name, bankRow.description);
@@ -3433,6 +3583,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       newSaved.push({
         id: `saved-${Date.now()}-${cashierRow.id}-${bankRow.id}`,
         cashierId: cashierRow.id, bankId: bankRow.id,
+        cashierSessionId: cashierRow._fileSessionId ?? 0, bankSessionId: bankRow._fileSessionId ?? 0,
         cashierName: cashierRow.name, bankDesc: bankRow.description,
         amount: bankRow.rawAmount, type: cashierRow.type,
         date: new Date().toLocaleDateString("ar-SA"),
@@ -3443,23 +3594,44 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         bankAccountType: bankRow.accountType, cashierAccountType: cashierRow.accountType
       });
     });
-    if (!newSaved.length) return;
+    if (!newSaved.length) {
+      if (skipped) setToast("لم تُحفظ المطابقات: تحقّق من عدم تكرار الفاتورة أو الحوالة ومن تطابق رقم الجوال والمبلغ.");
+      return;
+    }
+    onSafeActivities?.(newSaved.map(saved => `${saved.cashierName} ↔ ${saved.bankDesc} · ${fmtNum(saved.amount)} ₪`));
+    matchUndoRef.current = {
+      manualGroups: [...manualGroups],
+      savedMatches: [...savedMatches],
+      rejectedPairs: new Set(rejectedPairs),
+      nameAliases: { ...nameAliases },
+      selectedPendingKeys: new Set(selectedPendingKeys),
+    };
+    setCanUndoMatch(true);
     skipNextAutoReconcile.current = true;
+    setUndoMatchCount(newSaved.length);
     setSavedMatches(prev => [...prev, ...newSaved]);
-    const groupCashierIds = new Set(pairs.map(({ cashier }) => cashier.id));
-    const groupBankIds = new Set(pairs.map(({ bank }) => bank.id));
+    const groupCashierKeys = new Set(newSaved.flatMap(saved => {
+      const row = pairs.find(({ cashier }) => cashier.id === saved.cashierId && (cashier._fileSessionId ?? 0) === (saved.cashierSessionId ?? 0))?.cashier;
+      return row ? [transactionKey(row)] : [];
+    }));
+    const groupBankKeys = new Set(newSaved.flatMap(saved => {
+      const row = pairs.find(({ bank }) => bank.id === saved.bankId && (bank._fileSessionId ?? 0) === (saved.bankSessionId ?? 0))?.bank;
+      return row ? [transactionKey(row)] : [];
+    }));
     setResults(prev => {
       if (!prev) return prev;
       const savedResults: MatchResult[] = newSaved.flatMap(saved => {
         const pair = pairs.find(({ cashier, bank }) =>
           cashier.id === saved.cashierId && bank.id === saved.bankId
+          && (cashier._fileSessionId ?? 0) === (saved.cashierSessionId ?? 0)
+          && (bank._fileSessionId ?? 0) === (saved.bankSessionId ?? 0)
         );
         return pair ? [{ type: "saved" as const, cashier: pair.cashier, bank: pair.bank, savedMatch: saved }] : [];
       });
       const next = prev.filter(result => {
-        const resultCashierId = "cashier" in result ? result.cashier.id : null;
-        const resultBankId = "bank" in result ? result.bank.id : null;
-        return !groupCashierIds.has(resultCashierId ?? -1) && !groupBankIds.has(resultBankId ?? -1);
+        const resultCashierKey = "cashier" in result ? transactionKey(result.cashier) : "";
+        const resultBankKey = "bank" in result ? transactionKey(result.bank) : "";
+        return !groupCashierKeys.has(resultCashierKey) && !groupBankKeys.has(resultBankKey);
       });
       return [...savedResults, ...next];
     });
@@ -3471,12 +3643,13 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       }
     });
     if (Object.keys(aliasUpdates).length) setNameAliases(prev => ({ ...prev, ...aliasUpdates }));
-    setToast(`تم تأكيد ${newSaved.length} مطابقة`);
+    setToast(`تم تأكيد ${newSaved.length} مطابقة${skipped ? ` وتجاوز ${skipped} بسبب التكرار أو عدم تطابق شروط جوال بي` : ""}`);
     setSelectedPendingKeys(new Set());
   };
 
   const handleUnsaveMatch = (savedMatch: SavedMatch) => {
     if (!window.confirm("هل أنت متأكد من إلغاء حفظ هذه المطابقة؟")) return;
+    clearMatchUndo();
     if (savedMatch.sourceGroupId) {
       setSavedMatches(prev => prev.filter(s => s.sourceGroupId !== savedMatch.sourceGroupId));
       setManualGroups(prev => prev.filter(g => g.id !== savedMatch.sourceGroupId));
@@ -3495,6 +3668,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     if (!selected.size) return;
     const selectedMatches = savedMatches.filter(match => selected.has(match.id));
     if (!window.confirm(`إلغاء تأكيد ${selectedMatches.length} مطابقة محددة؟`)) return;
+    clearMatchUndo();
     const groupIds = new Set(selectedMatches.flatMap(match => match.sourceGroupId ? [match.sourceGroupId] : []));
     setSavedMatches(prev => prev.filter(match =>
       !selected.has(match.id) && (!match.sourceGroupId || !groupIds.has(match.sourceGroupId))
@@ -3509,6 +3683,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
 
   const handleRejectMatch = (cashierRow: CashierRow, bankRow: BankRow) => {
     const pairKey = `${cashierRow.id}-${bankRow.id}`;
+    clearMatchUndo();
     const next = new Set(rejectedPairs);
     next.add(pairKey);
     setRejected(next);
@@ -3518,7 +3693,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   };
 
   const handleReplaceBank = (cashierRow: CashierRow, oldBank: BankRow, newBank: BankRow) => {
-    const newSaved = handleSaveMatch(cashierRow, newBank, undefined, { force: true });
+    const newSaved = handleSaveMatch(cashierRow, newBank, undefined, { force: true, replacePair: { cashier: cashierRow, bank: oldBank } });
     if (!newSaved) {
       setToast("هذه الحوالة مرتبطة مسبقاً ولا يمكن استخدامها للاستبدال.");
       return;
@@ -3532,7 +3707,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     return reconciliationBankRows
       .filter(b => {
         if (b.type !== drawerCashier.type) return false;
-        const pairKey = `${drawerCashier.id}-${b.id}`;
+        const pairKey = `${transactionKey(drawerCashier)}-${transactionKey(b)}`;
         if (savedBankIds.has(b.id) && !savedKeys.has(pairKey)) return false;
         if (b.id === drawerOldBank?.id) return false;
         const nameMatch = !drawerNameSearch.trim() ||
@@ -3557,7 +3732,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       .filter(c => {
         if (c.type !== drawerOldBank.type) return false;
         if (visaCashierIds.has(c.id)) return false;
-        const pairKey = `${c.id}-${drawerOldBank.id}`;
+        const pairKey = `${transactionKey(c)}-${transactionKey(drawerOldBank)}`;
         if (savedCashierIds.has(c.id) && !savedKeys.has(pairKey)) return false;
         if (c.id === drawerCashier?.id) return false;
         const nameMatch = !drawerNameSearch.trim() ||
@@ -3615,7 +3790,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   };
 
   const handleReplaceCashier = (bankRow: BankRow, oldCashier: CashierRow, newCashier: CashierRow) => {
-    const newSaved = handleSaveMatch(newCashier, bankRow, undefined, { force: true });
+    const newSaved = handleSaveMatch(newCashier, bankRow, undefined, { force: true, replacePair: { cashier: oldCashier, bank: bankRow } });
     if (!newSaved) {
       setToast("هذه الفاتورة مرتبطة مسبقاً ولا يمكن استخدامها للاستبدال.");
       return;
@@ -3637,6 +3812,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
 
   const handleRejectSuggestion = (cashierRow: CashierRow, bankRow: BankRow) => {
     const pairKey = `${cashierRow.id}-${bankRow.id}`;
+    clearMatchUndo();
     const next = new Set(rejectedPairs);
     next.add(pairKey);
     setRejected(next);
@@ -3657,15 +3833,31 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         setToast("مطابقة جوال بي تتطلب حركة واحدة من كل ملف مع تطابق رقم الجوال والمبلغ.");
         return;
       }
+      if (savedMatches.some(match =>
+        (match.cashierId === cashier.id && (match.cashierSessionId == null || match.cashierSessionId === (cashier._fileSessionId ?? 0)))
+        || (match.bankId === bank.id && (match.bankSessionId == null || match.bankSessionId === (bank._fileSessionId ?? 0)))
+      )) {
+        setToast("لا يمكن إعادة استخدام فاتورة أو حوالة محفوظة في مطابقة أخرى.");
+        return;
+      }
     }
+    matchUndoRef.current = {
+      manualGroups: [...manualGroups],
+      savedMatches: [...savedMatches],
+      rejectedPairs: new Set(rejectedPairs),
+      nameAliases: { ...nameAliases },
+      selectedPendingKeys: new Set(selectedPendingKeys),
+    };
+    setCanUndoMatch(true);
     const newSaved: SavedMatch[] = [];
     g.banks.forEach(b => {
       g.cashiers.forEach(c => {
-        const pairKey = `${c.id}-${b.id}`;
+        const pairKey = `${transactionKey(c)}-${transactionKey(b)}`;
         if (savedKeys.has(pairKey)) return;
         newSaved.push({
           id: `manual-${g.id}-${c.id}-${b.id}`,
           cashierId: c.id, bankId: b.id,
+          cashierSessionId: c._fileSessionId ?? 0, bankSessionId: b._fileSessionId ?? 0,
           cashierName: c.name, bankDesc: b.description,
           amount: b.rawAmount, type: c.type,
           date: new Date().toLocaleDateString("ar-SA"),
@@ -3680,6 +3872,10 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
         });
       });
     });
+    if (newSaved.length) {
+      onSafeActivities?.(newSaved.map(saved => `${saved.cashierName} ↔ ${saved.bankDesc} · ${fmtNum(saved.amount)} ₪`));
+    }
+    setUndoMatchCount(Math.max(1, newSaved.length));
     setSavedMatches(prev => [...prev, ...newSaved]);
     const groupPairKeys = new Set(newSaved.map(s => `${s.cashierId}-${s.bankId}`));
     const groupCashierIds = new Set(newSaved.map(s => s.cashierId));
@@ -3696,9 +3892,24 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   };
 
   const handleRemoveGroup = (id: string) => {
+    clearMatchUndo();
     setSavedMatches(prev => prev.filter(s => s.sourceGroupId !== id));
     setManualGroups(prev => prev.filter(g => g.id !== id));
   };
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "z" || event.shiftKey || !canUndoMatch) return;
+      const target = event.target;
+      if (target instanceof HTMLElement && (
+        target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)
+      )) return;
+      event.preventDefault();
+      handleUndoMatch();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [canUndoMatch]);
 
   const handleHoldCashier = (c: CashierRow, note?: string) => {
     const fileSessionId = c._fileSessionId ?? cashFileSessionId;
@@ -3953,6 +4164,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       saved: results.filter(r => r.type === "saved").length,
       pending: results.filter(r => r.type === "pending").length,
       manual: results.filter((r:any) => r.type === "saved" && (r.savedMatch as SavedMatch).isManual).length,
+      review: reviewItems.length,
       visa: visaItems.length,
       jawwalPay: results.filter(r => r.type === "jawwalPay").length,
       mahmoudWallet: results.filter(r => r.type === "mahmoudWallet").length,
@@ -3961,7 +4173,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       uCashier: results.filter(r => r.type === "unmatchedCashier").length,
       uBank: results.filter(r => r.type === "unmatchedBank").length,
     };
-  }, [results, visaItems, heldItems, nonReconciliationBankRows]);
+  }, [results, visaItems, heldItems, nonReconciliationBankRows, reviewItems]);
 
   const canRun = bankRowsRaw.length > 0 && cashRowsRaw.length > 0 && bankMap.desc && cashMap.name && (cashMap.debit || cashMap.credit);
 
@@ -4001,7 +4213,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       savedAt: new Date().toLocaleString("ar-SA"),
       bankHeaders, bankRowsRaw, bankMap, bankSwap, bankFileSessionId,
       cashHeaders, cashRowsRaw, cashMap, cashSwap, cashFileSessionId,
-      manualGroups, savedMatches,
+      manualGroups, savedMatches, reviewItems,
       bankSplits, cutoffBatches, clearingGroups,
       nameAliases,
       rejectedSpecialCashierIds: Array.from(rejectedSpecialCashierIds),
@@ -4022,6 +4234,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   };
 
   const loadProject = (p: SavedProject) => {
+    clearMatchUndo();
     setBankH(p.bankHeaders); setBankRows(p.bankRowsRaw); setBankMap({ date: p.bankMap?.date ?? "", desc: p.bankMap?.desc ?? "", debit: p.bankMap?.debit ?? "", credit: p.bankMap?.credit ?? "", accountType: p.bankMap?.accountType ?? "", ref: (p.bankMap as any)?.ref ?? "" }); setBankSwap(p.bankSwap ?? false);
     setBankFileSessionId(p.bankFileSessionId ?? 0);
     setCashH(p.cashHeaders); setCashRows(p.cashRowsRaw); setCashMap({ date: p.cashMap?.date ?? "", name: p.cashMap?.name ?? "", debit: p.cashMap?.debit ?? "", credit: p.cashMap?.credit ?? "", accountType: p.cashMap?.accountType ?? "", ref: (p.cashMap as any)?.ref ?? "" }); setCashSwap(p.cashSwap ?? false);
@@ -4040,7 +4253,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     setJawwalCashHeaders(p.jawwalCashHeaders ?? []); setJawwalCashRows(p.jawwalCashRows ?? []);
     setJawwalCashMap({ date: p.jawwalCashMap?.date ?? "", name: p.jawwalCashMap?.name ?? "", debit: p.jawwalCashMap?.debit ?? "", credit: p.jawwalCashMap?.credit ?? "", ref: p.jawwalCashMap?.ref ?? "" });
     setJawwalCashSwap(p.jawwalCashSwap ?? false); setJawwalCashFileSessionId(p.jawwalCashFileSessionId ?? 0);
-    setManualGroups(p.manualGroups); setSavedMatches(p.savedMatches);
+    setManualGroups(p.manualGroups); setSavedMatches(p.savedMatches); setReviewItems(p.reviewItems ?? []);
     setBankSplits(p.bankSplits ?? []);
     setCutoffBatches(p.cutoffBatches ?? []);
     setClearingGroups(p.clearingGroups ?? []);
@@ -4085,6 +4298,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   const handleClearSavedMatches = () => {
     if (!savedMatches.length) return;
     if (!window.confirm(`مسح جميع المطابقات المؤكدة (${savedMatches.length})؟`)) return;
+    clearMatchUndo();
     setSavedMatches([]);
     setManualGroups([]);
     setSelectedSavedIds(new Set());
@@ -4099,6 +4313,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       ? `مسح ملفات وبيانات الجلسة الحالية مع الإبقاء على المعلّقات (${heldCount})؟\nسيتم حذف الكشوف والملفات المحفوظة للاسترجاع والمطابقات والفيزا والرفض، وستبقى الحركات المعلّقة لمتابعتها مع كشف اليوم التالي.`
       : "مسح الجلسة الحالية كاملة؟\nهاد بيحذف: الملفات (بكل المنصات)، الملفات المحفوظة للاسترجاع، المطابقات، الفيزا، المعلقات، والرفوض.\nالمشاريع المحفوظة رح تضل محفوظة.";
     if (!window.confirm(message)) return;
+    clearMatchUndo();
     setBankH([]); setBankRows([]); setBankMap({date:"",desc:"",debit:"",credit:"",accountType:"",ref:""}); setBankSwap(false); setBankFile(null); setBankFileCount(0); setBankFileSessionId(0);
     setCashH([]); setCashRows([]); setCashMap({date:"",name:"",debit:"",credit:"",accountType:"",ref:""}); setCashSwap(false); setCashFile(null); setCashFileCount(0); setCashFileSessionId(0); setStageAInvoices([]);
     setWalletBankFile(null); setWalletBankFileCount(0); setWalletBankHeaders([]); setWalletBankRows([]); setWalletBankMap({date:"",desc:"",debit:"",credit:"",ref:""}); setWalletBankSwap(false);
@@ -4111,6 +4326,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     setWalletBankFileSnapshots([]); setWalletCashFileSnapshots([]);
     setJawwalBankFileSnapshots([]); setJawwalCashFileSnapshots([]);
     setManualGroups([]); setSavedMatches([]); setRejected(new Set());
+    setReviewItems([]);
     setBankSplits([]); setCutoffBatches([]); setClearingGroups([]);
     setVisaItems([]);
     if (!preserveHeldItems) setHeldItems([]);
@@ -4147,7 +4363,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   const buildResumeData = (): ResumeData => ({
     bankHeaders, bankRowsRaw, bankMap, bankSwap, bankFileSessionId,
     cashHeaders, cashRowsRaw, cashMap, cashSwap, cashFileSessionId,
-    manualGroups, savedMatches,
+    manualGroups, savedMatches, reviewItems,
     bankSplits, cutoffBatches, clearingGroups,
     nameAliases,
     rejectedSpecialCashierIds: Array.from(rejectedSpecialCashierIds),
@@ -4189,7 +4405,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
     setCustomPlatforms(p.customPlatforms ?? []);
     nextCustomPlatformId.current = Math.max(0, ...(p.customPlatforms ?? []).map(platform => platform.id + 1));
     nextCustomSourceSessionId.current = Math.max(1, ...(p.customPlatforms ?? []).flatMap(platform => [platform.transfer?.fileSessionId ?? 0, platform.invoice?.fileSessionId ?? 0]).map(id => id + 1));
-    setManualGroups(p.manualGroups || []); setSavedMatches(p.savedMatches || []);
+    setManualGroups(p.manualGroups || []); setSavedMatches(p.savedMatches || []); setReviewItems(p.reviewItems ?? []);
     setBankSplits(p.bankSplits || []);
     setCutoffBatches(p.cutoffBatches || []);
     setClearingGroups(p.clearingGroups || []);
@@ -4360,13 +4576,13 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
   }
 
   if (page === "recon2") {
-    return <Reconciliation2 onBack={() => { setMainMode("default"); setPage("main"); }} onStageBToMain={() => { setMainMode("stageB"); setPage("main"); }} onStageAToMain={results => {
+    return <Reconciliation2 onSafeActivities={onSafeActivities} onBack={() => { setMainMode("default"); setPage("main"); }} onStageBToMain={() => { setMainMode("stageB"); setPage("main"); }} onStageAToMain={results => {
       setStageAInvoices(results.filter(result => result.matched && result.category !== "فيزا"));
       setPage("main");
     }} />;
   }
   if (page === "recon2StageA") {
-    return <Reconciliation2 initialStage="stageA" onBack={() => { setMainMode("default"); setPage("main"); }} onStageBToMain={() => { setMainMode("stageB"); setPage("main"); }} onStageAToMain={results => {
+    return <Reconciliation2 initialStage="stageA" onSafeActivities={onSafeActivities} onBack={() => { setMainMode("default"); setPage("main"); }} onStageBToMain={() => { setMainMode("stageB"); setPage("main"); }} onStageAToMain={results => {
       setStageAInvoices(results.filter(result => result.matched && result.category !== "فيزا"));
       setPage("main");
     }} />;
@@ -4391,7 +4607,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       category: "فيزا",
       categoryIssue: ""
     }));
-    return <Reconciliation2 initialStage="stageC" visaInvoices={visaInvoices} onBack={() => setPage("main")} />;
+    return <Reconciliation2 initialStage="stageC" visaInvoices={visaInvoices} onSafeActivities={onSafeActivities} onBack={() => setPage("main")} />;
   }
 
   const togglePendingSelect = (key: string) => {
@@ -4436,6 +4652,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
       `النتيجة بتضل بقائمة "منتظر" — ما رح تنتقل للمؤكدة إلا إذا ضغطتي حفظ.`
     )) return;
 
+    clearMatchUndo();
     const pendingCashierIds = new Set(pendingRows.map((r:any) => r.cashier.id as number));
     const pendingBankIds = new Set(pendingRows.map((r:any) => r.bank.id as number));
 
@@ -4457,6 +4674,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
 
   const handleMoveToManual = (pairs: Array<{ cashier: CashierRow; bank: BankRow }>) => {
     if (!pairs.length) return;
+    clearMatchUndo();
     setRejected(prev => {
       const next = new Set(prev);
       pairs.forEach(({ cashier, bank }) => next.add(`${cashier.id}-${bank.id}`));
@@ -4495,7 +4713,15 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
               <button onClick={() => setPage("assist")} className="rounded-lg border bg-white px-3 py-2 text-xs font-medium hover:bg-slate-50">Stage B · مراجعة</button>
             </>}
             <button onClick={() => setShowSettings(v => !v)} className="rounded-lg border bg-white px-3 py-2 text-xs font-medium hover:bg-slate-50">الإعدادات</button>
+            <button onClick={handleUndoMatch} disabled={!canUndoMatch} title="تراجع عن آخر مطابقة (Ctrl+Z)" aria-label="تراجع عن آخر مطابقة"
+              className="flex items-center gap-1.5 rounded-lg border bg-white px-3 py-2 text-xs font-medium hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40">
+              <RotateCcw className="h-3.5 w-3.5"/>تراجع{undoMatchCount > 1 ? ` (${undoMatchCount})` : ""}
+            </button>
             <ProjectsBar onSave={saveProject} onLoad={loadProject} onDelete={deleteProject} />
+            <button type="button" onClick={() => { setPage("main"); setResults(previous => previous ?? []); setTab("review"); }}
+              className="flex items-center gap-1.5 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800 hover:bg-amber-100">
+              <Star className="h-3.5 w-3.5" />المراجعة ({reviewItems.length})
+            </button>
              <button onClick={() => setPage("assist")}
               className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 transition-colors">
                مساعد المطابقة
@@ -5070,6 +5296,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
             <div className="grid grid-cols-4 sm:grid-cols-5 md:grid-cols-10 gap-2">
                {([
                  { id: "saved", label: "مؤكد", count: stats.saved, color: "text-green-700" },
+                 { id: "review", label: "مراجعة ★", count: stats.review, color: "text-amber-700" },
                  { id: "pending", label: "منتظر", count: stats.pending, color: "text-blue-700" },
                  { id: "manual", label: "يدوي", count: stats.manual, color: "text-orange-700" },
                  { id: "visa", label: "فيزا", count: stats.visa, color: "text-cyan-700" },
@@ -5109,8 +5336,18 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                   >
                     <Link2Off className="h-3.5 w-3.5" /> إلغاء تأكيد المحدد ({selectedSavedIds.size})
                   </button>
+                  <button
+                    type="button"
+                    onClick={handleUndoMatch}
+                    disabled={!canUndoMatch}
+                    title="تراجع عن آخر دفعة مطابقة (Ctrl+Z)"
+                    className="flex items-center gap-1.5 rounded-lg border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs text-blue-700 hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    <RotateCcw className="h-3.5 w-3.5" /> تراجع عن آخر دفعة{undoMatchCount > 1 ? ` (${undoMatchCount})` : ""}
+                  </button>
                 </div>
-                <table className="w-full text-sm">
+                <div className="overflow-x-auto">
+                <table className="w-full min-w-[1400px] text-sm">
                   <thead><tr className="bg-muted text-xs">
                     <th className="w-10 px-2 py-2.5 text-center">
                       <input
@@ -5184,10 +5421,23 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                               </div>
                             </td>
                             <td className="px-3 py-2.5 text-center">
-                              <button onClick={() => setExpandedMatchKey(isExpanded ? null : key)}
-                                className={`p-1 rounded transition-colors ${isExpanded ? "text-blue-600 bg-blue-100" : "text-muted-foreground hover:text-foreground hover:bg-muted"}`}>
-                                <span className="text-base leading-none font-bold">⋮</span>
-                              </button>
+                              <div className="flex items-center justify-center gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() => reviewItems.some(item => item.id === sm.id)
+                                    ? handleCompleteReviewItem(sm.id)
+                                    : handleAddReviewItem(sm, r.cashier, r.bank)}
+                                  title={reviewItems.some(item => item.id === sm.id) ? "إزالة نسخة المراجعة" : "إضافة نسخة إلى قائمة المراجعة"}
+                                  aria-label={reviewItems.some(item => item.id === sm.id) ? "إزالة من قائمة المراجعة" : "إضافة إلى قائمة المراجعة"}
+                                  aria-pressed={reviewItems.some(item => item.id === sm.id)}
+                                  className={`rounded p-1 transition-colors ${reviewItems.some(item => item.id === sm.id) ? "text-amber-600 hover:bg-amber-50" : "text-muted-foreground hover:bg-amber-50 hover:text-amber-600"}`}>
+                                  <Star className={`h-4 w-4 ${reviewItems.some(item => item.id === sm.id) ? "fill-current" : ""}`} />
+                                </button>
+                                <button onClick={() => setExpandedMatchKey(isExpanded ? null : key)}
+                                  className={`p-1 rounded transition-colors ${isExpanded ? "text-blue-600 bg-blue-100" : "text-muted-foreground hover:text-foreground hover:bg-muted"}`}>
+                                  <span className="text-base leading-none font-bold">⋮</span>
+                                </button>
+                              </div>
                             </td>
                           </tr>
                           {isExpanded && (
@@ -5221,7 +5471,56 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                     {!visibleSavedRows.length && <tr><td colSpan={8} className="py-10 text-center text-muted-foreground text-xs">لا توجد مطابقات مؤكدة تطابق الفلاتر</td></tr>}
                   </tbody>
                 </table>
+                </div>
                 </>
+              )}
+
+              {tab === "review" && (
+                <div className="p-4">
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-200 bg-amber-50/70 p-3">
+                    <div>
+                      <h2 className="text-sm font-bold text-amber-900">نسخ المطابقات للمراجعة</h2>
+                      <p className="mt-1 text-xs text-amber-800">هذه نسخ مستقلة للمراجعة فقط؛ حذفها أو إنهاء مراجعتها لا يغيّر المطابقات المؤكدة أو الحركات الأصلية.</p>
+                    </div>
+                    <span className="text-xs font-semibold text-amber-900">{reviewItems.length} عنصر</span>
+                  </div>
+                  <div className="overflow-x-auto rounded-xl border">
+                    <table className="w-full min-w-[900px] text-sm">
+                      <thead><tr className="bg-muted text-xs">
+                        <th className="px-3 py-2.5 text-right">الفاتورة</th>
+                        <th className="px-3 py-2.5 text-right">الحوالة</th>
+                        <th className="px-3 py-2.5 text-right">المبلغ</th>
+                        <th className="px-3 py-2.5 text-right">الحساب</th>
+                        <th className="px-3 py-2.5 text-right">تاريخ الإضافة للمراجعة</th>
+                        <th className="px-3 py-2.5 text-center">إجراء</th>
+                      </tr></thead>
+                      <tbody>
+                        {reviewItems.filter(item => {
+                          const search = resultSearch.trim().toLowerCase();
+                          const amount = item.bank.rawAmount;
+                          return (!search || `${item.cashier.name} ${item.bank.description} ${item.cashier.ref} ${item.bank.ref}`.toLowerCase().includes(search))
+                            && (resultType === "all" || item.cashier.type === resultType || item.bank.type === resultType)
+                            && (!minAmount || amount >= Number(minAmount))
+                            && (!maxAmount || amount <= Number(maxAmount));
+                        }).map(item => (
+                          <tr key={item.id} className="border-t">
+                            <td className="px-3 py-2.5 font-medium">{item.cashier.name}<div className="text-[10px] text-muted-foreground">{item.cashier.date || "بلا تاريخ"}</div></td>
+                            <td className="px-3 py-2.5">{item.bank.description}<div className="text-[10px] text-muted-foreground">{item.bank.date || "بلا تاريخ"}</div></td>
+                            <td className="px-3 py-2.5 font-mono font-semibold">{fmtNum(item.bank.rawAmount)}</td>
+                            <td className="px-3 py-2.5 text-xs">{item.bank.accountType || item.cashier.accountType || "—"}</td>
+                            <td className="px-3 py-2.5 text-xs text-muted-foreground">{item.addedAt}</td>
+                            <td className="px-3 py-2.5 text-center">
+                              <button type="button" onClick={() => handleCompleteReviewItem(item.id)} className="inline-flex items-center gap-1 rounded-lg border border-emerald-200 bg-emerald-50 px-2.5 py-1.5 text-xs text-emerald-800 hover:bg-emerald-100">
+                                <Check className="h-3.5 w-3.5" />تمت المراجعة / حذف
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                        {!reviewItems.length && <tr><td colSpan={6} className="py-10 text-center text-xs text-muted-foreground">لا توجد مطابقات في قائمة المراجعة. اضغط النجمة بجانب أي مطابقة مؤكدة لإضافة نسخة هنا.</td></tr>}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
               )}
 
               {tab === "pending" && (
@@ -5276,7 +5575,7 @@ export default function App({ initialPage = "recon2" }: { initialPage?: PageId }
                       <th className="px-3 py-2.5 text-right">بيان البنك</th>
                       <th className="px-3 py-2.5 text-right">النوع</th>
                       <th className="px-3 py-2.5 text-right">المبلغ</th>
-                      <th className="px-3 py-2.5 text-right">نوع المطابقة</th>
+                      <th className="px-3 py-2.5 text-right">نوع المطابقة</th>ا
                       <th className="px-3 py-2.5 text-right">الحالة</th>
                       <th className="px-3 py-2.5 w-10"></th>
                     </tr></thead>

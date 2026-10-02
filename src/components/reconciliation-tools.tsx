@@ -635,6 +635,8 @@ export function BatchCutoffTool({
   const [graceDays, setGraceDays] = useState(0);
   const [aggregateKey, setAggregateKey] = useState("");
   const [aggregateSearch, setAggregateSearch] = useState("");
+  const [aggregatePickerOpen, setAggregatePickerOpen] = useState(false);
+  const [aggregatePage, setAggregatePage] = useState(1);
   const [candidateSearch, setCandidateSearch] = useState("");
   const [candidatePage, setCandidatePage] = useState(1);
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
@@ -642,7 +644,13 @@ export function BatchCutoffTool({
   const [note, setNote] = useState("");
   const [formError, setFormError] = useState("");
   const aggregates = cashierRows.filter(row => !unavailableCashierKeys.has(sourceKey(row)));
-  const aggregateOptions = aggregates.filter(row => `${row.date} ${row.name} ${row.rawName} ${row.matchAmount}`.toLowerCase().includes(aggregateSearch.toLowerCase())).slice(0, 300);
+  const aggregateOptions = aggregates.filter(row => matchesSearch(
+    [row.date, row.name, row.rawName, row.ref, row.accountType, row.type, row.matchAmount, formatAmount(row.matchAmount)],
+    aggregateSearch,
+  ));
+  const aggregatePageSize = 50;
+  const aggregatePageCount = Math.max(1, Math.ceil(aggregateOptions.length / aggregatePageSize));
+  const visibleAggregates = aggregateOptions.slice((aggregatePage - 1) * aggregatePageSize, aggregatePage * aggregatePageSize);
   const aggregate = aggregates.find(row => sourceKey(row) === aggregateKey) ?? null;
   const canSelectPeriod = !!dateFrom && !!dateTo && dateFrom <= dateTo;
   const lowerDate = canSelectPeriod ? addDays(dateFrom, -graceDays) : "";
@@ -721,15 +729,11 @@ export function BatchCutoffTool({
               </select>
             </label>
             <div className="space-y-2">
-              <label className={labelClass}>ابحث عن سند الإجمالي
-                <input className={inputClass} value={aggregateSearch} onChange={event => setAggregateSearch(event.target.value)} placeholder="اسم السند أو تاريخه أو قيمته" />
-              </label>
-              <label className={labelClass}>سند الإجمالي المسجل
-              <select className={inputClass} value={aggregateKey} onChange={event => { setAggregateKey(event.target.value); setSelectedKeys(new Set()); setSelectionTouched(false); setCandidatePage(1); }}>
-                <option value="">اختر سند الإجمالي</option>
-                {aggregateOptions.map(row => <option key={sourceKey(row)} value={sourceKey(row)}>{row.date || "بلا تاريخ"} · {row.name} · {formatAmount(row.matchAmount)}</option>)}
-              </select>
-              </label>
+              <span className={labelClass}>سند الإجمالي المسجل</span>
+              <button type="button" onClick={() => { setAggregateSearch(""); setAggregatePage(1); setAggregatePickerOpen(true); }} className={`${inputClass} flex items-center justify-between gap-2 text-right hover:bg-muted/40`}>
+                <span className="truncate">{aggregate ? `${aggregate.date || "بلا تاريخ"} · ${aggregate.name} · ${formatAmount(aggregate.matchAmount)}` : "اختر سند الإجمالي"}</span>
+                <Search className="h-4 w-4 shrink-0 text-muted-foreground" />
+              </button>
             </div>
           </div>
           {aggregate && <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 text-sm">
@@ -822,6 +826,58 @@ export function BatchCutoffTool({
           })}
         </div>
       </section>
+      {aggregatePickerOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 p-3 sm:p-6" onMouseDown={event => {
+          if (event.target === event.currentTarget) setAggregatePickerOpen(false);
+        }}>
+          <section role="dialog" aria-modal="true" aria-labelledby="cutoff-aggregate-picker-title" className="flex max-h-[90vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border bg-card shadow-2xl">
+            <header className="flex items-start justify-between gap-3 border-b p-4 sm:p-5">
+              <div>
+                <h2 id="cutoff-aggregate-picker-title" className="text-lg font-bold">اختيار الفاتورة أو السند الإجمالي</h2>
+                <p className="mt-1 text-xs text-muted-foreground">ابحث بالاسم أو البيان أو التاريخ أو المرجع أو المبلغ، ثم اختر السند المطلوب.</p>
+              </div>
+              <button type="button" onClick={() => setAggregatePickerOpen(false)} className="rounded-lg p-2 hover:bg-muted" aria-label="إغلاق"><X className="h-5 w-5" /></button>
+            </header>
+            <div className="border-b p-4">
+              <div className="relative">
+                <Search className="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                <input autoFocus className={`${inputClass} pr-10`} value={aggregateSearch} onChange={event => { setAggregateSearch(event.target.value); setAggregatePage(1); }} placeholder="ابحث في الفواتير والسندات بالاسم أو التاريخ أو المبلغ..." />
+              </div>
+              <p className="mt-2 text-xs text-muted-foreground">{aggregateOptions.length} حركة متاحة للعرض</p>
+            </div>
+            <div className="min-h-0 flex-1 overflow-auto p-3 sm:p-4">
+              <div className="overflow-x-auto rounded-xl border">
+                <table className="w-full min-w-[780px] text-sm">
+                  <thead className="sticky top-0 bg-muted text-xs"><tr>
+                    <th className="px-3 py-3 text-right">التاريخ</th><th className="px-3 py-3 text-right">البيان / اسم السند</th><th className="px-3 py-3 text-right">المرجع</th><th className="px-3 py-3 text-right">الحساب</th><th className="px-3 py-3 text-right">الاتجاه</th><th className="px-3 py-3 text-right">المبلغ</th><th className="px-3 py-3 text-center">اختيار</th>
+                  </tr></thead>
+                  <tbody>
+                    {visibleAggregates.map(row => <tr key={sourceKey(row)} className="border-t hover:bg-muted/30">
+                      <td className="px-3 py-2.5">{row.date || "—"}</td><td className="px-3 py-2.5 font-medium">{row.name || row.rawName || "سند بلا اسم"}</td><td className="px-3 py-2.5">{row.ref || "—"}</td><td className="px-3 py-2.5 text-xs text-muted-foreground">{row.accountType || "—"}</td><td className="px-3 py-2.5">{row.type}</td><td className="px-3 py-2.5 font-mono">{formatAmount(row.matchAmount)}</td>
+                      <td className="px-3 py-2.5 text-center"><button type="button" onClick={() => {
+                        setAggregateKey(sourceKey(row));
+                        setSelectedKeys(new Set());
+                        setSelectionTouched(false);
+                        setCandidatePage(1);
+                        setFormError("");
+                        setAggregatePickerOpen(false);
+                      }} className="rounded-lg bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground hover:opacity-90">اختيار</button></td>
+                    </tr>)}
+                    {!visibleAggregates.length && <tr><td colSpan={7} className="py-8 text-center text-xs text-muted-foreground">لا توجد حركات متاحة تطابق البحث.</td></tr>}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <footer className="flex items-center justify-between border-t p-3 text-xs text-muted-foreground">
+              <span>صفحة {aggregatePage} من {aggregatePageCount} · عرض {visibleAggregates.length} من {aggregateOptions.length}</span>
+              <div className="flex gap-2">
+                <button type="button" disabled={aggregatePage >= aggregatePageCount} onClick={() => setAggregatePage(page => Math.min(aggregatePageCount, page + 1))} className="inline-flex items-center gap-1 rounded-lg border px-3 py-1.5 disabled:opacity-40">التالي <ChevronLeft className="h-4 w-4" /></button>
+                <button type="button" disabled={aggregatePage <= 1} onClick={() => setAggregatePage(page => Math.max(1, page - 1))} className="inline-flex items-center gap-1 rounded-lg border px-3 py-1.5 disabled:opacity-40"><ChevronRight className="h-4 w-4" /> السابق</button>
+              </div>
+            </footer>
+          </section>
+        </div>
+      )}
     </ToolFrame>
   );
 }

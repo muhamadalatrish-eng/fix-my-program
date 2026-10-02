@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState, type ChangeEvent, type DragEvent } from "react"
 import * as XLSX from "xlsx"
 import { AlertTriangle, ArrowDownToLine, ChevronDown, FileSpreadsheet, Plus, RefreshCw, ShieldCheck, Sparkles, Trash2, Upload, X } from "lucide-react"
-import { extractStatementRows, mergeSelectedStatements, type StatementCell, type StatementFormat } from "../lib/account-statement-processor"
+import { cleanStatementText, extractStatementRows, isStatementBalanceSummaryRow, mergeSelectedStatements, removeStatementBalances, type StatementCell, type StatementFormat } from "../lib/account-statement-processor"
 
 type StatementDocument = {
   id: string
@@ -38,14 +38,16 @@ async function parseFile(file: File): Promise<StatementDocument> {
   })))
   if (!statement) throw new Error("لم أتعرف على ترويسة كشف الحساب في هذا الملف.")
   if (!statement.rows.length) throw new Error("تم التعرف على الأعمدة، لكن لم يتم العثور على حركات.")
+  const rows = statement.rows.map((values) => Object.fromEntries(statement.headers.map((header, index) => [header, values[index] ?? ""])))
+  const cleaned = removeStatementBalances(statement.headers, rows)
   return {
     id: `${Date.now()}-${nextId++}`,
     fileName: file.name,
     format: statement.format,
-    headers: statement.headers,
-    rows: statement.rows,
-    selectedColumns: statement.headers.map((header) => !/رصيد|balance/i.test(header)),
-    selectedRows: statement.rows.map(() => true),
+    headers: cleaned.headers,
+    rows: cleaned.rows.map((row) => cleaned.headers.map((header) => cleanStatementText((row[header] ?? "") as StatementCell))),
+    selectedColumns: cleaned.headers.map(() => true),
+    selectedRows: cleaned.rows.map(() => true),
     pages: statement.headerBlocks,
   }
 }
@@ -58,6 +60,7 @@ export function AccountStatementProcessor() {
   const [dragging, setDragging] = useState(false)
   const [errors, setErrors] = useState<string[]>([])
   const [downloaded, setDownloaded] = useState(false)
+  const [filterNotice, setFilterNotice] = useState("")
   const merged = useMemo(() => mergeSelectedStatements(documents), [documents])
   const selectedCount = documents.reduce((count, item) => count + item.selectedRows.filter(Boolean).length, 0)
 
@@ -67,6 +70,7 @@ export function AccountStatementProcessor() {
     setBusy(true)
     setErrors([])
     setDownloaded(false)
+    setFilterNotice("")
     const loaded: StatementDocument[] = []
     const failed: string[] = []
     for (const file of files) {
@@ -96,9 +100,28 @@ export function AccountStatementProcessor() {
     setDownloaded(false)
   }
 
+  const applyFiltering = () => {
+    setDocuments((current) => current.map((document) => {
+      const keptColumns = document.headers.map((header, index) => ({ header, index }))
+        .filter(({ header }) => !/رصيد|balance/i.test(header))
+      const keptRows = document.rows.map((row, index) => ({ row, index }))
+        .filter(({ row }) => !isStatementBalanceSummaryRow(row))
+      const headers = keptColumns.map(({ header }) => header)
+      return {
+        ...document,
+        headers,
+        rows: keptRows.map(({ row }) => keptColumns.map(({ index }) => cleanStatementText(row[index]))),
+        selectedColumns: keptColumns.map(({ index }) => document.selectedColumns[index]),
+        selectedRows: keptRows.map(({ index }) => document.selectedRows[index]),
+      }
+    }))
+    setDownloaded(false)
+    setFilterNotice("تمت فلترة الأرصدة وتنظيف عبارات بطاقة الائتمان من جميع الكشوف.")
+  }
+
   const download = () => {
     if (!merged.headers.length || !merged.rows.length) return
-    const sheet = XLSX.utils.aoa_to_sheet([merged.headers, ...merged.rows])
+    const sheet = XLSX.utils.aoa_to_sheet([merged.headers, ...merged.rows.map((row) => row.map(cleanStatementText))])
     const workbook = XLSX.utils.book_new()
     XLSX.utils.book_append_sheet(workbook, sheet, "الكشف المنظف")
     XLSX.writeFile(workbook, "كشف-الحسابات-المنظف.xlsx")
@@ -140,7 +163,11 @@ export function AccountStatementProcessor() {
 
         {!!documents.length && <>
           <section className="space-y-3">
-            <div><h2 className="text-lg font-bold">اختر ما تريد الاحتفاظ به من كل ملف</h2><p className="mt-1 text-xs text-slate-500">يُتعرّف على صفحات كشف الأستاذ المتتابعة، وتُستبعد أسطر الرصيد السابق والمجموع. عمود الرصيد الجاري غير محدد تلقائياً؛ المدين والدائن هما مبالغ الحركات.</p></div>
+            <div><h2 className="text-lg font-bold">اختر ما تريد الاحتفاظ به من كل ملف</h2><p className="mt-1 text-xs text-slate-500">يُتعرّف على صفحات كشف الأستاذ المتتابعة، وتُستبعد أعمدة الرصيد وأسطر الرصيد السابق والمجموع تلقائياً. المدين والدائن هما مبالغ الحركات.</p></div>
+            <div className="flex flex-wrap items-center gap-3">
+              <button type="button" onClick={applyFiltering} className="inline-flex items-center gap-2 rounded-xl border border-cyan-200 bg-cyan-50 px-4 py-2 text-sm font-semibold text-cyan-900 hover:bg-cyan-100"><Sparkles className="h-4 w-4" />فلترة الأرصدة وتنظيف بطاقة الائتمان</button>
+              {filterNotice && <span role="status" className="text-xs text-emerald-700">{filterNotice}</span>}
+            </div>
             {downloaded && <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 p-3">
               <span className="text-sm font-medium text-emerald-900">تم تنزيل الملف. يمكنك حذف الكشوفات الحالية والبدء من جديد.</span>
               <button type="button" onClick={() => { setDocuments([]); setExpanded(null); setDownloaded(false) }} className="inline-flex items-center gap-2 rounded-lg bg-rose-700 px-3 py-2 text-xs font-semibold text-white hover:bg-rose-800">

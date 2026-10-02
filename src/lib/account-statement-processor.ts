@@ -37,6 +37,15 @@ export function normalizeHeader(value: StatementCell): string {
     .replace(/\s+/g, "")
 }
 
+export function cleanStatementText(value: StatementCell): StatementCell {
+  if (typeof value !== "string") return value
+  return value
+    .replace(/(?:بطاقة\s+(?:ال)?ائتمان(?:ية)?|credit\s*card)\s*[/／]?\s*/gi, "")
+    .replace(/^\s*\/\s*|\s*\/\s*$/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
 function headerCandidateScore(row: StatementCell[]): number {
   const indexes = row.map((cell, index) => hasValue(cell) ? index : -1).filter((index) => index >= 0)
   if (indexes.length < 2) return -1
@@ -135,6 +144,30 @@ function isMetadataRow(row: StatementCell[]): boolean {
   return row.some((cell) => /issued\s+(?:on|by)|أصدرها|أصدرت\s+بتاريخ|نسخة\s+مرخصة|رقم\s+الصفحة/i.test(String(cell ?? "")))
 }
 
+export function isStatementBalanceSummaryRow(values: unknown[]): boolean {
+  return values.some((value) => {
+    const normalized = normalizeHeader(String(value ?? "")).replace(/\s+/g, "")
+    return /^(?:الرصيد|رصيد)(?:(?:السابق|الافتتاحي|الافتتاح|الحالي|الختامي|النهائي|المدور|المرحل|اولالمدة|اخرالمدة|اولمدة|اخرمدة|بدايةالمدة|نهايةالمدة))?$/.test(normalized)
+      || /^(?:(?:opening|closing|previous|current|ending|beginning)?balance|balance(?:broughtforward|broughtdown|carriedforward|carrieddown))$/.test(normalized)
+  })
+}
+
+export function removeStatementBalances(
+  headers: string[],
+  rows: Array<Record<string, unknown>>,
+): { headers: string[]; rows: Array<Record<string, unknown>> } {
+  const keptHeaders = headers.filter((header) => {
+    const normalized = normalizeHeader(header)
+    return !normalized.includes("رصيد") && !normalized.includes("balance")
+  })
+  return {
+    headers: keptHeaders,
+    rows: rows
+      .filter((row) => !isStatementBalanceSummaryRow(headers.map((header) => row[header])))
+      .map((row) => Object.fromEntries(keptHeaders.map((header) => [header, cleanStatementText((row[header] ?? "") as StatementCell)]))),
+  }
+}
+
 function isDateValue(value: StatementCell): boolean {
   if (value instanceof Date) return !Number.isNaN(value.getTime())
   const text = String(value ?? "").trim()
@@ -149,6 +182,15 @@ function isDateValue(value: StatementCell): boolean {
     ? [Number(first), Number(second), Number(third)]
     : [Number(third), Number(second), Number(first)]
   return year >= 1900 && year <= 2200 && month >= 1 && month <= 12 && day >= 1 && day <= 31
+}
+
+function extractPageDate(row: StatementCell[]): string {
+  for (const cell of row) {
+    const text = String(cell ?? "")
+    const match = text.match(/(?:في|on)\s*[:：]?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})/i)
+    if (match && isDateValue(match[1])) return match[1]
+  }
+  return ""
 }
 
 function isNumericAmount(value: StatementCell): boolean {
@@ -188,8 +230,11 @@ function extractRecognizedStatementRows(sheets: StatementSheet[]): ExtractedStat
   for (const sheet of sheets) {
     let active: HeaderIndexes | null = null
     let readingTransactions = false
+    let pageDate = ""
     for (const sourceRow of sheet.rows) {
       sourceRows += 1
+      const detectedPageDate = extractPageDate(sourceRow)
+      if (detectedPageDate) pageDate = detectedPageDate
       const detected = findHeaderIndexes(sourceRow)
       if (detected) {
         active = detected
@@ -214,6 +259,11 @@ function extractRecognizedStatementRows(sheets: StatementSheet[]): ExtractedStat
       } else {
         if (isMetadataRow(sourceRow)) continue
         const transaction = active.indexes.map((index) => index < 0 ? "" : sourceRow[index] ?? "")
+        if (isDateValue(transaction[1])) {
+          if (typeof transaction[1] === "string") transaction[1] = transaction[1].trim()
+        } else if (pageDate) {
+          transaction[1] = pageDate
+        }
         if (!hasValue(transaction[0])) continue
         if (!transaction.some(hasValue)) continue
         rows.push(transaction)
